@@ -1,0 +1,5 @@
+{
+  "name": "experimental RepoScripter",
+  "description": "Transform GitHub repositories into unique JS5-driven generative art with a feral design-brain persona, focusing on canvas-based visual systems.",
+  "requestFramePermissions": []
+}

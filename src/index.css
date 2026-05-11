@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-bg: #050505;
+  --color-panel: #0a0a0a;
+  --color-panel2: #111111;
+  --color-border: #1a1a1a;
+  --color-text: #e0e0e0;
+  --color-muted: #666666;
+  --color-accent: #7b2fff;
+  --color-accent2: #00e5ff;
+  --color-accent3: #ff2f6d;
+}
+
+@layer base {
+  body {
+    @apply bg-bg text-text font-sans overflow-hidden h-screen;
+  }
+
+  * {
+    @apply box-border m-0 p-0;
+  }
+}
+
+@layer utilities {
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 4px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-border hover:bg-muted transition-colors;
+  }
+}
+
+input[type="text"],
+input[type="password"],
+input[type="number"],
+select,
+textarea {
+  @apply w-full bg-bg border border-border text-text font-sans text-[0.8rem] p-2 outline-none transition-colors duration-150 focus:border-accent;
+}
