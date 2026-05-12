@@ -35,7 +35,8 @@ import {
   Library,
   Copy,
   Plus,
-  Search
+  Search,
+  Archive
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as THREE from 'three';
@@ -118,7 +119,7 @@ interface AppState {
   isLoadingRepos: boolean;
   status: string;
   js5Code: string;
-  activePanel: 'github' | 'prompt' | 'history' | 'settings' | 'export' | 'library' | null;
+  activePanel: 'github' | 'prompt' | 'history' | 'settings' | 'export' | 'library' | 'archive' | null;
   isRecording: boolean;
   recordingSeconds: number;
   isExportingToGH: boolean;
@@ -136,6 +137,9 @@ interface AppState {
   isSnapshotting: boolean;
   exportStatus: string;
   isReactorCollapsed: boolean;
+  // Archive
+  archiveFiles: { name: string; path: string; sha: string }[];
+  isLoadingArchive: boolean;
 }
 
 // --- Constants ---
@@ -332,8 +336,13 @@ const JS5Canvas = ({
   exportRatio: string,
   isExportingVideo: boolean,
   videoExportMinutes: number,
+  videoBitrate: string,
+  videoFps: number,
+  isSnapshotting: boolean,
   onExportProgress: (progress: number) => void,
+  onExportStatus?: (status: string) => void,
   onExportComplete: () => void,
+  onSnapshotComplete?: () => void,
   onStreamReady?: (stream: MediaStream) => void,
   audioData?: { bass: number, mid: number, treble: number },
   entropy?: number,
@@ -623,31 +632,43 @@ const JS5Canvas = ({
         output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
         error: (e) => {
           console.error("VideoEncoder Error:", e);
-          onExportStatus?.("ENCODER ERROR: " + e.message);
+          onStatusRef.current?.("ENCODER ERROR: " + e.message);
         }
       });
 
-      // Hardware-accelerated High Profile (avc1.640028) is generally well-supported and handles high bitrates better
-      const config: VideoEncoderConfig = {
-        codec: 'avc1.640028', 
-        width,
-        height,
-        bitrate: bitrate,
-        framerate: fps,
-        latencyMode: 'quality'
-      };
+      // Use a more robust profile cascade for 1080p+ @ 60fps
+      const codecs = ['avc1.4d002a', 'avc1.64002a', 'avc1.42E02a'];
+      let configured = false;
+      
+      for (const codec of codecs) {
+        try {
+          encoder.configure({
+            codec,
+            width,
+            height,
+            bitrate: bitrate,
+            framerate: fps,
+            hardwareAcceleration: 'prefer-hardware'
+          });
+          configured = true;
+          console.log("Encoder configured with:", codec);
+          break;
+        } catch (e) {
+          console.warn(`Codec ${codec} failed, trying next...`);
+        }
+      }
 
-      try {
-        encoder.configure(config);
-      } catch (e: any) {
-        console.error("Initial Config failed, falling back to Baseline:", e);
-        encoder.configure({ ...config, codec: 'avc1.42E01E' });
+      if (!configured) {
+        onStatusRef.current?.("HARDWARE INITIALIZATION FAILED");
+        isCapturing = false;
+        onCompleteRef.current?.();
+        return;
       }
 
       const captureLoop = async () => {
         if (!effectActive || !isCapturing || !recCanvas || !recCtx) return;
         
-        // Ensure encoder is ready
+        // Wait for configured state (some drivers are async)
         if (encoder.state !== 'configured') {
           setTimeout(captureLoop, 100);
           return;
@@ -655,7 +676,7 @@ const JS5Canvas = ({
 
         const timeInSeconds = currentFrame / fps;
 
-        // Render to recording canvas
+        // Render pass
         try {
           if (contextType === '2d') {
             const r2d = recCtx as CanvasRenderingContext2D;
@@ -678,15 +699,27 @@ const JS5Canvas = ({
             renderASCII(recCtx as CanvasRenderingContext2D, output, recBaseCharWidth, recBaseCharHeight, recBaseFontSize);
           }
 
-          // Create VideoFrame and encode
-          // Critical: Fix timestamp to use integer microseconds and provide duration
+          // Encode frame
           const frameDuration = 1_000_000 / fps;
           const timestamp = Math.floor(currentFrame * frameDuration);
           const frame = new VideoFrame(recCanvas, { 
             timestamp, 
             duration: Math.floor(frameDuration) 
           });
-          encoder.encode(frame, { keyFrame: currentFrame % fps === 0 });
+
+          // Standard backpressure: Wait if the encoder is overwhelmed
+          if (encoder.encodeQueueSize > 25) {
+            await new Promise(r => {
+              const check = () => {
+                if (!isCapturing || encoder.encodeQueueSize < 5) r(null);
+                else setTimeout(check, 10);
+              };
+              check();
+            });
+            if (!isCapturing) { frame.close(); return; }
+          }
+
+          encoder.encode(frame, { keyFrame: currentFrame % (fps * 2) === 0 });
           frame.close();
 
           currentFrame++;
@@ -701,35 +734,74 @@ const JS5Canvas = ({
           if (currentFrame < totalFrames) {
             setTimeout(captureLoop, 0);
           } else {
-            onStatusRef.current?.("SEALING MP4 CONTAINER...");
-            await encoder.flush();
-            muxer.finalize();
-            const { buffer } = muxer.target as ArrayBufferTarget;
-            const blob = new Blob([buffer], { type: 'video/mp4' });
-            const url = URL.createObjectURL(blob);
-            
-            const adHocName = userInput 
-              ? userInput.split(' ').slice(0, 3).join('_').replace(/[^a-z0-9]/gi, '_').toLowerCase() 
-              : 'alchemical_render';
-            const timestampStr = new Date().toISOString().replace(/[:.]/g, '-');
-            const fileName = `reposcripter_${adHocName}_${timestampStr}.mp4`;
+            onStatusRef.current?.("SEALING ALCHEMICAL CONTAINER...");
+            try {
+              // DRAIN: Explicitly wait for the queue to clear before flushing
+              onStatusRef.current?.("DRAINING HARDWARE QUEUE...");
+              let drainWait = 0;
+              while (encoder.encodeQueueSize > 0 && isCapturing && drainWait < 1500) {
+                await new Promise(r => setTimeout(r, 20));
+                drainWait++;
+              }
+              
+              console.log("Queue drained. Starting flush...");
+              
+              // Flush with a generous timeout
+              const flushPromise = encoder.flush();
+              const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error("Timeout")), 20000)
+              );
 
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = fileName;
-            
-            document.body.appendChild(a);
-            setTimeout(() => {
-              a.click();
-              document.body.removeChild(a);
-              URL.revokeObjectURL(url);
+              try {
+                await Promise.race([flushPromise, timeoutPromise]);
+              } catch (flushErr: any) {
+                console.warn("Forcing finalization after flush stall:", flushErr.message);
+              }
+
+              muxer.finalize();
+              
+              const { buffer } = muxer.target as ArrayBufferTarget;
+              if (!buffer || buffer.byteLength === 0) throw new Error("Generated buffer is empty");
+
+              const blob = new Blob([buffer], { type: 'video/mp4' });
+              const url = URL.createObjectURL(blob);
+              
+              onStatusRef.current?.("ALCHEMY COMPLETE. DISPATCHING...");
+              
+              const adHocName = userInput 
+                ? userInput.split(' ').slice(0, 3).join('_').replace(/[^a-z0-9]/gi, '_').toLowerCase() 
+                : 'alchemical_render';
+              const timestampStr = new Date().toISOString().replace(/[:.]/g, '-');
+              const fileName = `reposcripter_${adHocName}_${timestampStr}.mp4`;
+
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = fileName;
+              document.body.appendChild(a);
+              
+              setTimeout(() => {
+                a.click();
+                setTimeout(() => {
+                  if (document.body.contains(a)) document.body.removeChild(a);
+                  URL.revokeObjectURL(url);
+                  isCapturing = false;
+                  onCompleteRef.current?.();
+                }, 1500);
+              }, 200);
+
+              if ((encoder as any).state !== 'closed') encoder.close();
+            } catch (finalizeError: any) {
+              console.error("Finalization Error:", finalizeError);
+              onStatusRef.current?.("HALTED: " + finalizeError.message);
+              isCapturing = false;
               onCompleteRef.current?.();
-            }, 100);
+            }
           }
-        } catch (e) {
+        } catch (e: any) {
           console.error("Export Loop Error:", e);
           onStatusRef.current?.("HALTED: RENDER EXCEPTION");
           isCapturing = false;
+          onCompleteRef.current?.();
         }
       };
 
@@ -1151,6 +1223,71 @@ const HistoryPanel = ({ history, user, handleLogin, setState, setRepoContexts, h
   </div>
 );
 
+const ArchivePanel = ({ state, setState, handleLoadArchive, handleLoadArchiveFile }: any) => {
+  return (
+    <div className="flex flex-col gap-4">
+      {!state.ghToken ? (
+        <div className="text-center py-10 text-muted text-[0.65rem] uppercase tracking-widest opacity-30"> GitHub Token Required </div>
+      ) : (
+        <>
+          <div className="flex flex-col gap-2">
+            <label className="text-[0.6rem] uppercase tracking-widest text-muted">Archive Repository Owner</label>
+            <input 
+              type="text"
+              value={state.ghUser}
+              placeholder="e.g. merrypranxter"
+              onChange={e => setState((s: any) => ({ ...s, ghUser: e.target.value }))}
+              className="bg-bg border border-border px-3 py-2 text-[0.7rem] font-mono text-accent2 focus:border-accent outline-none transition-all placeholder:opacity-30"
+            />
+            <div className="text-[0.5rem] text-muted-foreground/50 leading-relaxed">
+              Default is your username. Enter a custom owner if the archive lives elsewhere.
+            </div>
+          </div>
+
+          <button 
+            onClick={handleLoadArchive}
+            disabled={state.isLoadingArchive}
+            className="bg-accent2 text-bg py-2 text-[0.7rem] font-bold uppercase tracking-widest hover:bg-white transition-all disabled:opacity-50"
+          >
+            {state.isLoadingArchive ? <Loader2 className="animate-spin w-4 h-4 mx-auto" /> : 'Synchronize Archive'}
+          </button>
+
+          {state.archiveFiles.length === 0 ? (
+            <div className="text-center py-10 text-muted text-[0.65rem] uppercase tracking-widest opacity-30 flex flex-col gap-3">
+              <span>{state.isLoadingArchive ? 'Synchronizing...' : 'No relevant files found'}</span>
+              <div className="flex flex-col gap-1 text-[0.5rem] normal-case text-muted/40">
+                <span>Looking in: {state.ghUser || 'merrypranxter'}/repo_script_js5_code</span>
+                <span>Searching for: .js, .js5, .txt, .glsl</span>
+                {state.status.includes('failed') && <span className="text-accent3/50">{state.status}</span>}
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2">
+               <label className="text-[0.6rem] uppercase tracking-widest text-muted">Stored Alchemies ({state.archiveFiles.length})</label>
+               <div className="flex flex-col gap-2 max-h-[60vh] overflow-y-auto custom-scrollbar pr-2">
+                {state.archiveFiles.map((file: any) => (
+                  <button 
+                    key={file.sha}
+                    onClick={() => handleLoadArchiveFile(file.path)}
+                    className="w-full text-left bg-bg border border-border p-3 hover:border-accent transition-all group flex flex-col gap-1"
+                  >
+                    <div className="text-[0.7rem] font-mono text-accent2 group-hover:text-accent truncate">{file.name}</div>
+                    <div className="text-[0.5rem] text-muted flex items-center gap-2">
+                      <span className="uppercase tracking-widest">Path: {file.path}</span>
+                      <span className="opacity-30">|</span>
+                      <span>SHA: {file.sha.slice(0, 7)}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
 const PromptLibraryPanel = ({ prompts, setState, handleDeletePrompt }: any) => (
   <div className="flex flex-col gap-4">
     {prompts.length === 0 ? (
@@ -1499,6 +1636,8 @@ function AppContent() {
     isSnapshotting: false,
     exportStatus: '',
     isReactorCollapsed: false,
+    archiveFiles: [],
+    isLoadingArchive: false,
   });
 
   const [hasKey, setHasKey] = useState<boolean | null>(null);
@@ -1754,6 +1893,69 @@ function AppContent() {
       ...s,
       selectedRepos: s.selectedRepos.filter((_, i) => i !== index)
     }));
+  };
+
+  const handleLoadArchive = async () => {
+    if (!state.ghToken) {
+      setState(s => ({ ...s, status: 'Error: GitHub token required for archive' }));
+      return;
+    }
+    
+    // Default to 'merrypranxter' if ghUser is also empty, though usually ghUser is set during login
+    const owner = state.ghUser || 'merrypranxter';
+    const repo = 'repo_script_js5_code';
+    
+    setState(s => ({ ...s, isLoadingArchive: true, status: `Rummaging through ${owner}/${repo}...` }));
+    try {
+      // Use recursive tree API to find files anywhere in the repo
+      const res = await fetch(`${GH_API}/repos/${owner}/${repo}/git/trees/HEAD?recursive=1`, {
+        headers: { 'X-GitHub-Token': state.ghToken }
+      });
+      
+      if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error(`Repository ${owner}/${repo} not found. Check credentials or owner name.`);
+        }
+        throw new Error(`GitHub error ${res.status}`);
+      }
+      
+      const data = await res.json();
+      const files = (data.tree || [])
+        .filter((f: any) => f.type === 'blob' && (
+          f.path.endsWith('.js') || 
+          f.path.endsWith('.js5') || 
+          f.path.endsWith('.txt') ||
+          f.path.endsWith('.glsl')
+        ))
+        .map((f: any) => ({ 
+          name: f.path.split('/').pop(), 
+          path: f.path, 
+          sha: f.sha 
+        }));
+        
+      setState(s => ({ 
+        ...s, 
+        archiveFiles: files, 
+        isLoadingArchive: false, 
+        status: `Loaded ${files.length} recursive archive records` 
+      }));
+    } catch (e: any) {
+      setState(s => ({ ...s, isLoadingArchive: false, status: `Archive retrieval failed: ${e.message}` }));
+    }
+  };
+
+  const handleLoadArchiveFile = async (path: string) => {
+    if (!state.ghToken) return;
+    const owner = state.ghUser || 'merrypranxter';
+    setState(s => ({ ...s, status: `Extracting ${path}...` }));
+    try {
+      const content = await getFileContent(owner, 'repo_script_js5_code', path, state.ghToken);
+      if (content) {
+        setState(s => ({ ...s, js5Code: content, activePanel: null, status: `✓ Reconstituted ${path}` }));
+      }
+    } catch (e: any) {
+      setState(s => ({ ...s, status: `Extraction failed: ${e.message}` }));
+    }
   };
 
   const handleStartVideoExport = () => {
@@ -2336,6 +2538,12 @@ function AppContent() {
                 label="History"
               />
               <SidebarIcon 
+                icon={Archive} 
+                active={state.activePanel === 'archive'} 
+                onClick={() => togglePanel('archive')} 
+                label="GitHub Archive"
+              />
+              <SidebarIcon 
                 icon={Library} 
                 active={state.activePanel === 'library'} 
                 onClick={() => togglePanel('library')} 
@@ -2519,6 +2727,14 @@ function AppContent() {
                 />
               )}
               {state.activePanel === 'library' && <PromptLibraryPanel prompts={prompts} setState={setState} handleDeletePrompt={handleDeletePrompt} />}
+              {state.activePanel === 'archive' && (
+                <ArchivePanel 
+                  state={state} 
+                  setState={setState} 
+                  handleLoadArchive={handleLoadArchive} 
+                  handleLoadArchiveFile={handleLoadArchiveFile} 
+                />
+              )}
               {state.activePanel === 'settings' && <SettingsPanel state={state} setState={setState} user={user} handleLogout={handleLogout} handleLogin={handleLogin} />}
               {state.activePanel === 'export' && <ExportPanel 
                 state={state} 
