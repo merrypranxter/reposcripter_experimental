@@ -689,8 +689,7 @@ const JS5Canvas = ({
             width, height,
             bitrate,
             framerate: fps,
-            hardwareAcceleration: 'prefer-hardware',
-            latencyMode: 'realtime'
+            hardwareAcceleration: 'prefer-hardware'
           });
           onStatusRef.current?.("ENGINE STABILIZED. BEGINNING RENDER...");
         } catch (e: any) {
@@ -706,70 +705,7 @@ const JS5Canvas = ({
           if (!effectActive || !isCapturing || !recCanvas || !recCtx) return;
 
           try {
-            // Processing burst: Render up to 40 frames if the hardware can keep up
-            const maxBurst = 40;
-            let burstCount = 0;
-
-            while (isCapturing && currentFrame < totalFrames && burstCount < maxBurst && encoder.encodeQueueSize < 120) {
-              const timeInSeconds = currentFrame / fps;
-
-              // Render
-              if (contextType === '2d') {
-                const r2d = recCtx as CanvasRenderingContext2D;
-                r2d.fillStyle = '#050505';
-                r2d.fillRect(0, 0, width, height);
-              }
-
-              const output = renderFn(
-                { cols: Math.floor(width / recBaseCharWidth), rows: Math.floor(height / recBaseCharHeight), width, height, canvas: recCanvas }, 
-                timeInSeconds, 
-                repoContexts, 
-                userInput, 
-                { x: 0, y: 0, isPressed: false }, 
-                recCtx, 
-                recCanvas,
-                THREE
-              );
-
-              if (output && contextType === '2d') {
-                renderASCII(recCtx as CanvasRenderingContext2D, output, recBaseCharWidth, recBaseCharHeight, recBaseFontSize);
-              }
-
-              // Encode
-              const frameDuration = 1_000_000 / fps;
-              const timestamp = Math.floor(currentFrame * frameDuration);
-              const frame = new VideoFrame(recCanvas, { 
-                timestamp, 
-                duration: Math.floor(frameDuration) 
-              });
-
-              encoder.encode(frame, { keyFrame: currentFrame % 120 === 0 });
-              frame.close();
-
-              currentFrame++;
-              burstCount++;
-            }
-
-            // Sync UI state throttled
-            const progress = Math.floor((currentFrame / totalFrames) * 100);
-            if (progress !== lastReportedProgress) {
-              onProgressRef.current(progress);
-              lastReportedProgress = progress;
-            }
-            
-            const now = Date.now();
-            if (now - lastStatusUpdate > 2000) {
-              const msgIdx = Math.min(statusMessages.length - 1, Math.floor((currentFrame / totalFrames) * statusMessages.length));
-              onStatusRef.current?.(`${statusMessages[msgIdx]} (${currentFrame}/${totalFrames})`);
-              lastStatusUpdate = now;
-            }
-
-            if (currentFrame < totalFrames) {
-              // Yield to let encoder/muxer finish their work. 
-              // If hardware is lagging (high queue), give it a longer breather.
-              const wait = encoder.encodeQueueSize > 60 ? 30 : 0;
-              setTimeout(captureLoop, wait);
-            } else {
+            if (currentFrame >= totalFrames) {
               onStatusRef.current?.("SEALING ALCHEMICAL CONTAINER...");
               try {
                 onStatusRef.current?.("DRAINING HARDWARE QUEUE...");
@@ -827,6 +763,78 @@ const JS5Canvas = ({
                 onStatusRef.current?.("HALTED: " + finalizeError.message);
                 isCapturing = false;
                 onCompleteRef.current?.();
+              }
+              return;
+            }
+
+            // Processing burst: Render up to 15 frames if the hardware can keep up
+            let processed = 0;
+            const maxBurst = 15;
+            
+            while (isCapturing && currentFrame < totalFrames && processed < maxBurst && encoder.encodeQueueSize < 60) {
+              const timeInSeconds = currentFrame / fps;
+
+              if (contextType === '2d') {
+                const r2d = recCtx as CanvasRenderingContext2D;
+                r2d.fillStyle = '#050505';
+                r2d.fillRect(0, 0, width, height);
+              }
+
+              const output = renderFn(
+                { cols: Math.floor(width / recBaseCharWidth), rows: Math.floor(height / recBaseCharHeight), width, height, canvas: recCanvas }, 
+                timeInSeconds, 
+                repoContexts, 
+                userInput, 
+                { x: 0, y: 0, isPressed: false }, 
+                recCtx, 
+                recCanvas,
+                THREE
+              );
+
+              if (output && contextType === '2d') {
+                renderASCII(recCtx as CanvasRenderingContext2D, output, recBaseCharWidth, recBaseCharHeight, recBaseFontSize);
+              }
+
+              const frameDuration = 1_000_000 / fps;
+              const timestamp = Math.floor(currentFrame * frameDuration);
+              const frame = new VideoFrame(recCanvas, { 
+                timestamp, 
+                duration: Math.floor(frameDuration) 
+              });
+
+              encoder.encode(frame, { keyFrame: currentFrame % 120 === 0 });
+              frame.close();
+
+              currentFrame++;
+              processed++;
+            }
+
+            // Updates
+            const progress = Math.floor((currentFrame / totalFrames) * 100);
+            if (progress !== lastReportedProgress) {
+              onProgressRef.current(progress);
+              lastReportedProgress = progress;
+            }
+            
+            const now = Date.now();
+            if (now - lastStatusUpdate > 2000) {
+              const msgIdx = Math.min(statusMessages.length - 1, Math.floor((currentFrame / totalFrames) * statusMessages.length));
+              onStatusRef.current?.(`${statusMessages[msgIdx]} (${currentFrame}/${totalFrames})`);
+              lastStatusUpdate = now;
+            }
+
+            // Yield and reschedule
+            if (isCapturing && currentFrame < totalFrames) {
+              if (encoder.encodeQueueSize > 40) {
+                (async () => {
+                  let w = 0;
+                  while (encoder.encodeQueueSize > 15 && w++ < 200) {
+                    await new Promise(r => setTimeout(r, 20));
+                  }
+                  if (isCapturing) setTimeout(captureLoop, 0);
+                })();
+              } else {
+                setTimeout(captureLoop, 0);
               }
             }
           } catch (e: any) {
