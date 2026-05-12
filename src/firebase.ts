@@ -76,7 +76,6 @@ export async function addDoc(colPath: string, data: any) {
     id: Math.random().toString(36).substr(2, 9),
     ...data,
     createdAt: {
-      toDate: () => new Date(),
       seconds: Date.now() / 1000
     }
   };
@@ -113,9 +112,16 @@ export function limit(n: number) {
 export function onSnapshot(q: any, onNext: (snapshot: any) => void, onError?: (error: any) => void) {
   const colPath = q;
   const key = STORAGE_KEYS[colPath as keyof typeof STORAGE_KEYS] || STORAGE_KEYS.renders;
-  
+
   const load = () => {
-    const items = JSON.parse(localStorage.getItem(key) || '[]');
+    const rawItems = JSON.parse(localStorage.getItem(key) || '[]');
+    const items = rawItems.map((item: any) => ({
+      ...item,
+      createdAt: {
+        toDate: () => new Date((item.createdAt?.seconds ?? Date.now() / 1000) * 1000),
+        seconds: item.createdAt?.seconds ?? Date.now() / 1000
+      }
+    }));
     onNext({
       forEach: (callback: (doc: any) => void) => {
         items.forEach((item: any) => callback({ id: item.id, data: () => item }));
@@ -128,7 +134,7 @@ export function onSnapshot(q: any, onNext: (snapshot: any) => void, onError?: (e
 }
 
 export function serverTimestamp() {
-  return { toDate: () => new Date() };
+  return { seconds: Date.now() / 1000 };
 }
 
 export async function getDocFromServer() {

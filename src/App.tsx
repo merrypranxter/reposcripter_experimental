@@ -689,7 +689,8 @@ const JS5Canvas = ({
             width, height,
             bitrate,
             framerate: fps,
-            hardwareAcceleration: 'prefer-hardware'
+            hardwareAcceleration: 'prefer-hardware',
+            latencyMode: 'realtime'
           });
           onStatusRef.current?.("ENGINE STABILIZED. BEGINNING RENDER...");
         } catch (e: any) {
@@ -700,102 +701,87 @@ const JS5Canvas = ({
           return;
         }
 
+        let lastReportedProgress = -1;
         const captureLoop = async () => {
           if (!effectActive || !isCapturing || !recCanvas || !recCtx) return;
 
           try {
-            const timeInSeconds = currentFrame / fps;
+            // Processing burst: Render up to 40 frames if the hardware can keep up
+            const maxBurst = 40;
+            let burstCount = 0;
 
-            // Render pass
-            if (contextType === '2d') {
-              const r2d = recCtx as CanvasRenderingContext2D;
-              r2d.fillStyle = '#050505';
-              r2d.fillRect(0, 0, width, height);
-            }
+            while (isCapturing && currentFrame < totalFrames && burstCount < maxBurst && encoder.encodeQueueSize < 120) {
+              const timeInSeconds = currentFrame / fps;
 
-            const output = renderFn(
-              { cols: Math.floor(width / recBaseCharWidth), rows: Math.floor(height / recBaseCharHeight), width, height, canvas: recCanvas }, 
-              timeInSeconds, 
-              repoContexts, 
-              userInput, 
-              { x: 0, y: 0, isPressed: false }, 
-              recCtx, 
-              recCanvas,
-              THREE
-            );
-
-            if (output && contextType === '2d') {
-              renderASCII(recCtx as CanvasRenderingContext2D, output, recBaseCharWidth, recBaseCharHeight, recBaseFontSize);
-            }
-
-            // Encode frame
-            const frameDuration = 1_000_000 / fps;
-            const timestamp = Math.floor(currentFrame * frameDuration);
-            const frame = new VideoFrame(recCanvas, { 
-              timestamp, 
-              duration: Math.floor(frameDuration) 
-            });
-
-            // Backpressure: Wait ONLY if the encoder is significantly overwhelmed
-            if (encoder.encodeQueueSize > 50) {
-              const startWait = Date.now();
-              let reportedStall = false;
-              while (isCapturing && encoder.encodeQueueSize > 15) {
-                await new Promise(r => setTimeout(r, 20));
-                
-                if (!reportedStall && Date.now() - startWait > 1500) {
-                  onStatusRef.current?.(`WAITING ON GPU... [${encoder.encodeQueueSize} pending]`);
-                  reportedStall = true;
-                }
-
-                if (Date.now() - startWait > 10000) {
-                   break; 
-                }
+              // Render
+              if (contextType === '2d') {
+                const r2d = recCtx as CanvasRenderingContext2D;
+                r2d.fillStyle = '#050505';
+                r2d.fillRect(0, 0, width, height);
               }
-              if (reportedStall) {
-                onStatusRef.current?.("GPU SYNCED. RESUMING...");
+
+              const output = renderFn(
+                { cols: Math.floor(width / recBaseCharWidth), rows: Math.floor(height / recBaseCharHeight), width, height, canvas: recCanvas }, 
+                timeInSeconds, 
+                repoContexts, 
+                userInput, 
+                { x: 0, y: 0, isPressed: false }, 
+                recCtx, 
+                recCanvas,
+                THREE
+              );
+
+              if (output && contextType === '2d') {
+                renderASCII(recCtx as CanvasRenderingContext2D, output, recBaseCharWidth, recBaseCharHeight, recBaseFontSize);
               }
-            }
-            
-            if (!isCapturing) {
+
+              // Encode
+              const frameDuration = 1_000_000 / fps;
+              const timestamp = Math.floor(currentFrame * frameDuration);
+              const frame = new VideoFrame(recCanvas, { 
+                timestamp, 
+                duration: Math.floor(frameDuration) 
+              });
+
+              encoder.encode(frame, { keyFrame: currentFrame % 120 === 0 });
               frame.close();
-              return;
+
+              currentFrame++;
+              burstCount++;
             }
 
-            encoder.encode(frame, { keyFrame: currentFrame % 60 === 0 });
-            frame.close();
-
-            currentFrame++;
-            
+            // Sync UI state throttled
             const progress = Math.floor((currentFrame / totalFrames) * 100);
-            onProgressRef.current(progress);
+            if (progress !== lastReportedProgress) {
+              onProgressRef.current(progress);
+              lastReportedProgress = progress;
+            }
             
             const now = Date.now();
-            if (now - lastStatusUpdate > 1500) {
+            if (now - lastStatusUpdate > 2000) {
               const msgIdx = Math.min(statusMessages.length - 1, Math.floor((currentFrame / totalFrames) * statusMessages.length));
               onStatusRef.current?.(`${statusMessages[msgIdx]} (${currentFrame}/${totalFrames})`);
               lastStatusUpdate = now;
             }
 
             if (currentFrame < totalFrames) {
-              if (currentFrame % 30 === 0) {
-                requestAnimationFrame(captureLoop);
-              } else {
-                setTimeout(captureLoop, 0);
-              }
+              // Yield to let encoder/muxer finish their work. 
+              // If hardware is lagging (high queue), give it a longer breather.
+              const wait = encoder.encodeQueueSize > 60 ? 30 : 0;
+              setTimeout(captureLoop, wait);
             } else {
               onStatusRef.current?.("SEALING ALCHEMICAL CONTAINER...");
               try {
                 onStatusRef.current?.("DRAINING HARDWARE QUEUE...");
                 let drainWait = 0;
-                while (encoder.encodeQueueSize > 0 && drainWait < 1500) {
-                  await new Promise(r => setTimeout(r, 20));
+                while (encoder.encodeQueueSize > 0 && drainWait < 2000) {
+                  await new Promise(r => setTimeout(r, 30));
                   drainWait++;
                 }
                 
                 const flushPromise = encoder.flush();
                 const timeoutPromise = new Promise((_, reject) => 
-                  setTimeout(() => reject(new Error("Timeout")), 20000)
+                  setTimeout(() => reject(new Error("Timeout")), 30000)
                 );
 
                 try {
