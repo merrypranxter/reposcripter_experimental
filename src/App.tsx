@@ -689,7 +689,7 @@ const JS5Canvas = ({
             width, height,
             bitrate,
             framerate: fps,
-            hardwareAcceleration: 'prefer-hardware'
+            hardwareAcceleration: 'no-preference'
           });
           onStatusRef.current?.("ENGINE STABILIZED. BEGINNING RENDER...");
         } catch (e: any) {
@@ -717,14 +717,11 @@ const JS5Canvas = ({
                 
                 const flushPromise = encoder.flush();
                 const timeoutPromise = new Promise((_, reject) => 
-                  setTimeout(() => reject(new Error("Timeout")), 30000)
+                  setTimeout(() => reject(new Error("GPU Flush Timeout")), 30000)
                 );
 
-                try {
-                  await Promise.race([flushPromise, timeoutPromise]);
-                } catch (flushErr: any) {
-                  console.warn("Forcing finalization after flush stall:", flushErr.message);
-                }
+                // If flush fails or times out, we do NOT finalize (prevents corrupted MP4s)
+                await Promise.race([flushPromise, timeoutPromise]);
 
                 muxer.finalize();
                 
@@ -767,11 +764,11 @@ const JS5Canvas = ({
               return;
             }
 
-            // Processing burst: Render up to 15 frames if the hardware can keep up
+            // Processing burst: Render up to 2 frames if the hardware can keep up
             let processed = 0;
-            const maxBurst = 15;
+            const maxBurst = 2;
             
-            while (isCapturing && currentFrame < totalFrames && processed < maxBurst && encoder.encodeQueueSize < 60) {
+            while (isCapturing && currentFrame < totalFrames && processed < maxBurst && encoder.encodeQueueSize < 12) {
               const timeInSeconds = currentFrame / fps;
 
               if (contextType === '2d') {
@@ -825,17 +822,11 @@ const JS5Canvas = ({
 
             // Yield and reschedule
             if (isCapturing && currentFrame < totalFrames) {
-              if (encoder.encodeQueueSize > 40) {
-                (async () => {
-                  let w = 0;
-                  while (encoder.encodeQueueSize > 15 && w++ < 200) {
-                    await new Promise(r => setTimeout(r, 20));
-                  }
-                  if (isCapturing) setTimeout(captureLoop, 0);
-                })();
-              } else {
-                setTimeout(captureLoop, 0);
+              if (encoder.encodeQueueSize > 8) {
+                // Throttle: wait for queue to drain slightly
+                await new Promise(r => setTimeout(r, 10));
               }
+              setTimeout(captureLoop, 0);
             }
           } catch (e: any) {
             console.error("Capture Loop Error:", e);
