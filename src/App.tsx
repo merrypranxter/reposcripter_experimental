@@ -1036,7 +1036,7 @@ const GitHubPanel = ({ state, setState, handleLoadRepos, handleAddRepo, handleRe
             <div className="text-[0.6rem] text-muted/40 italic py-2">No repos selected...</div>
           ) : (
             state.selectedRepos.map((repo: any, idx: number) => (
-              <div key={idx} className="flex items-center justify-between bg-bg border border-border px-2 py-1 text-[0.65rem] group">
+              <div key={`sel-${repo.name}-${idx}`} className="flex items-center justify-between bg-bg border border-border px-2 py-1 text-[0.65rem] group">
                 <span className="truncate text-accent2">{repo.name}</span>
                 <button onClick={() => handleRemoveRepo(idx)} className="text-muted hover:text-accent3">✕</button>
               </div>
@@ -1076,8 +1076,8 @@ const GitHubPanel = ({ state, setState, handleLoadRepos, handleAddRepo, handleRe
           }}
         >
           <option value="">{state.repos.length > 0 ? (filteredRepos.length > 0 ? `+ Add from ${filteredRepos.length} matches` : 'No matches found') : '+ Add Repo'}</option>
-          {filteredRepos.map((repo: any) => (
-            <option key={repo.id} value={repo.name}>{repo.name}</option>
+          {filteredRepos.map((repo: any, idx: number) => (
+            <option key={`repo-${repo.id || idx}-${idx}`} value={repo.name}>{repo.name}</option>
           ))}
         </select>
       </div>
@@ -1133,9 +1133,9 @@ const PromptPanel = ({ state, setState, handleGenerate, handleSaveToLibrary, pro
               className="absolute top-full left-0 right-0 mt-2 bg-panel border border-border shadow-2xl z-[110] max-h-48 overflow-y-auto custom-scrollbar rounded-md p-1"
             >
               <div className="px-2 py-1 text-[0.5rem] uppercase tracking-widest text-muted border-b border-border/30 mb-1">Select from Library</div>
-              {prompts.map((p: any) => (
+              {prompts.map((p: any, idx: number) => (
                 <button 
-                  key={p.id}
+                  key={`menu-p-${p.id || idx}-${idx}`}
                   onClick={() => insertPrompt(p.text)}
                   className="w-full text-left px-3 py-2 hover:bg-white/5 text-[0.7rem] transition-colors rounded-sm flex flex-col gap-0.5 group"
                 >
@@ -1185,8 +1185,8 @@ const HistoryPanel = ({ history, user, handleLogin, setState, setRepoContexts, h
     ) : (
       <>
         <div className="flex flex-col gap-3">
-          {history.map((item: any) => (
-            <div key={item.id} className="bg-bg border border-border p-3 hover:border-accent transition-colors cursor-pointer group"
+          {history.map((item: any, idx: number) => (
+            <div key={`hist-${item.id || idx}-${idx}`} className="bg-bg border border-border p-3 hover:border-accent transition-colors cursor-pointer group"
               onClick={() => {
                 setState((s: any) => ({ ...s, js5Code: item.js5Code, artPrompt: item.prompt }));
               }}
@@ -1205,8 +1205,8 @@ const HistoryPanel = ({ history, user, handleLogin, setState, setRepoContexts, h
                 </button>
               </div>
               <div className="flex flex-wrap gap-1">
-                {item.repos.map((r: string) => (
-                  <span key={r} className="text-[0.5rem] bg-panel2 px-1.5 py-0.5 text-muted uppercase">{r}</span>
+                {item.repos.map((r: string, rIdx: number) => (
+                  <span key={`hist-r-${r}-${rIdx}`} className="text-[0.5rem] bg-panel2 px-1.5 py-0.5 text-muted uppercase">{r}</span>
                 ))}
               </div>
             </div>
@@ -1265,9 +1265,9 @@ const ArchivePanel = ({ state, setState, handleLoadArchive, handleLoadArchiveFil
             <div className="flex flex-col gap-2">
                <label className="text-[0.6rem] uppercase tracking-widest text-muted">Stored Alchemies ({state.archiveFiles.length})</label>
                <div className="flex flex-col gap-2 max-h-[60vh] overflow-y-auto custom-scrollbar pr-2">
-                {state.archiveFiles.map((file: any) => (
+                {state.archiveFiles.map((file: any, idx: number) => (
                   <button 
-                    key={file.sha}
+                    key={`archive-${file.path}-${idx}`}
                     onClick={() => handleLoadArchiveFile(file.path)}
                     className="w-full text-left bg-bg border border-border p-3 hover:border-accent transition-all group flex flex-col gap-1"
                   >
@@ -1294,8 +1294,8 @@ const PromptLibraryPanel = ({ prompts, setState, handleDeletePrompt }: any) => (
       <div className="text-center py-10 text-muted text-[0.65rem] uppercase tracking-widest opacity-30">Library Empty</div>
     ) : (
       <div className="flex flex-col gap-3">
-        {prompts.map((p: any) => (
-          <div key={p.id} className="bg-bg border border-border p-3 hover:border-accent transition-colors cursor-pointer group"
+        {prompts.map((p: any, idx: number) => (
+          <div key={`lib-p-${p.id || idx}-${idx}`} className="bg-bg border border-border p-3 hover:border-accent transition-colors cursor-pointer group"
             onClick={() => {
               setState((s: any) => ({ ...s, artPrompt: p.text, activePanel: 'prompt' }));
             }}
