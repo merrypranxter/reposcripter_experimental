@@ -544,6 +544,7 @@ const JS5Canvas = ({
     };
 
     const renderASCII = (context: CanvasRenderingContext2D, output: any, cW: number, cH: number, baseSize: number) => {
+      context.textBaseline = 'top';
       if (typeof output === 'string') {
         const lines = output.split('\n');
         context.font = `${baseSize}px monospace`;
@@ -554,28 +555,50 @@ const JS5Canvas = ({
       } else if (Array.isArray(output)) {
         let currentFont = '';
         output.forEach((row, y) => {
-          if (Array.isArray(row)) {
-            row.forEach((char, x) => {
-              if (typeof char === 'object' && char !== null) {
-                const size = char.size || baseSize;
-                const font = `${size}px monospace`;
-                if (currentFont !== font) {
-                  context.font = font;
-                  currentFont = font;
-                }
-                context.fillStyle = char.color || '#7b2fff';
-                context.fillText(char.char || ' ', x * cW, y * cH);
-              } else if (typeof char === 'string') {
-                const font = `${baseSize}px monospace`;
-                if (currentFont !== font) {
-                  context.font = font;
-                  currentFont = font;
-                }
-                context.fillStyle = '#7b2fff';
-                context.fillText(char, x * cW, y * cH);
+          if (!Array.isArray(row)) return;
+          
+          let currentText = '';
+          let startX = 0;
+          let currentColor = '';
+          let currentSize = 0;
+
+          const flush = (x: number) => {
+            if (currentText) {
+              const font = `${currentSize || baseSize}px monospace`;
+              if (currentFont !== font) {
+                context.font = font;
+                currentFont = font;
               }
-            });
-          }
+              const color = currentColor || '#7b2fff';
+              if (context.fillStyle !== color) context.fillStyle = color;
+              context.fillText(currentText, startX * cW, y * cH);
+              currentText = '';
+            }
+            startX = x;
+          };
+
+          row.forEach((char, x) => {
+            if (typeof char === 'object' && char !== null) {
+              const charColor = char.color || '#7b2fff';
+              const charSize = char.size || baseSize;
+              if (charColor !== currentColor || charSize !== currentSize) {
+                flush(x);
+                currentColor = charColor;
+                currentSize = charSize;
+              }
+              currentText += char.char || ' ';
+            } else if (typeof char === 'string') {
+              if (currentColor !== '#7b2fff' || currentSize !== baseSize) {
+                flush(x);
+                currentColor = '#7b2fff';
+                currentSize = baseSize;
+              }
+              currentText += char;
+            } else {
+              flush(x + 1);
+            }
+          });
+          flush(row.length);
         });
       }
     };
@@ -612,6 +635,7 @@ const JS5Canvas = ({
 
       const totalFrames = Math.floor(videoExportMinutes * 60 * fps);
       let currentFrame = 0;
+      let lastStatusUpdate = Date.now();
 
       const statusMessages = [
         "Transmuting source history...",
@@ -633,179 +657,202 @@ const JS5Canvas = ({
         error: (e) => {
           console.error("VideoEncoder Error:", e);
           onStatusRef.current?.("ENCODER ERROR: " + e.message);
-        }
-      });
-
-      // Use a more robust profile cascade for 1080p+ @ 60fps
-      const codecs = ['avc1.4d002a', 'avc1.64002a', 'avc1.42E02a'];
-      let configured = false;
-      
-      for (const codec of codecs) {
-        try {
-          encoder.configure({
-            codec,
-            width,
-            height,
-            bitrate: bitrate,
-            framerate: fps,
-            hardwareAcceleration: 'prefer-hardware'
-          });
-          configured = true;
-          console.log("Encoder configured with:", codec);
-          break;
-        } catch (e) {
-          console.warn(`Codec ${codec} failed, trying next...`);
-        }
-      }
-
-      if (!configured) {
-        onStatusRef.current?.("HARDWARE INITIALIZATION FAILED");
-        isCapturing = false;
-        onCompleteRef.current?.();
-        return;
-      }
-
-      const captureLoop = async () => {
-        if (!effectActive || !isCapturing || !recCanvas || !recCtx) return;
-        
-        // Wait for configured state (some drivers are async)
-        if (encoder.state !== 'configured') {
-          setTimeout(captureLoop, 100);
-          return;
-        }
-
-        const timeInSeconds = currentFrame / fps;
-
-        // Render pass
-        try {
-          if (contextType === '2d') {
-            const r2d = recCtx as CanvasRenderingContext2D;
-            r2d.fillStyle = '#050505';
-            r2d.fillRect(0, 0, width, height);
-          }
-
-          const output = renderFn(
-            { cols: Math.floor(width / recBaseCharWidth), rows: Math.floor(height / recBaseCharHeight), width, height, canvas: recCanvas }, 
-            timeInSeconds, 
-            repoContexts, 
-            userInput, 
-            { x: 0, y: 0, isPressed: false }, 
-            recCtx, 
-            recCanvas,
-            THREE
-          );
-
-          if (output && contextType === '2d') {
-            renderASCII(recCtx as CanvasRenderingContext2D, output, recBaseCharWidth, recBaseCharHeight, recBaseFontSize);
-          }
-
-          // Encode frame
-          const frameDuration = 1_000_000 / fps;
-          const timestamp = Math.floor(currentFrame * frameDuration);
-          const frame = new VideoFrame(recCanvas, { 
-            timestamp, 
-            duration: Math.floor(frameDuration) 
-          });
-
-          // Standard backpressure: Wait if the encoder is overwhelmed
-          if (encoder.encodeQueueSize > 25) {
-            await new Promise(r => {
-              const check = () => {
-                if (!isCapturing || encoder.encodeQueueSize < 5) r(null);
-                else setTimeout(check, 10);
-              };
-              check();
-            });
-            if (!isCapturing) { frame.close(); return; }
-          }
-
-          encoder.encode(frame, { keyFrame: currentFrame % (fps * 2) === 0 });
-          frame.close();
-
-          currentFrame++;
-          const progress = Math.floor((currentFrame / totalFrames) * 100);
-          onProgressRef.current(progress);
-          
-          if (currentFrame % Math.max(1, Math.floor(totalFrames / statusMessages.length)) === 0) {
-            const msgIdx = Math.min(statusMessages.length - 1, Math.floor((currentFrame / totalFrames) * statusMessages.length));
-            onStatusRef.current?.(statusMessages[msgIdx]);
-          }
-
-          if (currentFrame < totalFrames) {
-            setTimeout(captureLoop, 0);
-          } else {
-            onStatusRef.current?.("SEALING ALCHEMICAL CONTAINER...");
-            try {
-              // DRAIN: Explicitly wait for the queue to clear before flushing
-              onStatusRef.current?.("DRAINING HARDWARE QUEUE...");
-              let drainWait = 0;
-              while (encoder.encodeQueueSize > 0 && isCapturing && drainWait < 1500) {
-                await new Promise(r => setTimeout(r, 20));
-                drainWait++;
-              }
-              
-              console.log("Queue drained. Starting flush...");
-              
-              // Flush with a generous timeout
-              const flushPromise = encoder.flush();
-              const timeoutPromise = new Promise((_, reject) => 
-                setTimeout(() => reject(new Error("Timeout")), 20000)
-              );
-
-              try {
-                await Promise.race([flushPromise, timeoutPromise]);
-              } catch (flushErr: any) {
-                console.warn("Forcing finalization after flush stall:", flushErr.message);
-              }
-
-              muxer.finalize();
-              
-              const { buffer } = muxer.target as ArrayBufferTarget;
-              if (!buffer || buffer.byteLength === 0) throw new Error("Generated buffer is empty");
-
-              const blob = new Blob([buffer], { type: 'video/mp4' });
-              const url = URL.createObjectURL(blob);
-              
-              onStatusRef.current?.("ALCHEMY COMPLETE. DISPATCHING...");
-              
-              const adHocName = userInput 
-                ? userInput.split(' ').slice(0, 3).join('_').replace(/[^a-z0-9]/gi, '_').toLowerCase() 
-                : 'alchemical_render';
-              const timestampStr = new Date().toISOString().replace(/[:.]/g, '-');
-              const fileName = `reposcripter_${adHocName}_${timestampStr}.mp4`;
-
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = fileName;
-              document.body.appendChild(a);
-              
-              setTimeout(() => {
-                a.click();
-                setTimeout(() => {
-                  if (document.body.contains(a)) document.body.removeChild(a);
-                  URL.revokeObjectURL(url);
-                  isCapturing = false;
-                  onCompleteRef.current?.();
-                }, 1500);
-              }, 200);
-
-              if ((encoder as any).state !== 'closed') encoder.close();
-            } catch (finalizeError: any) {
-              console.error("Finalization Error:", finalizeError);
-              onStatusRef.current?.("HALTED: " + finalizeError.message);
-              isCapturing = false;
-              onCompleteRef.current?.();
-            }
-          }
-        } catch (e: any) {
-          console.error("Export Loop Error:", e);
-          onStatusRef.current?.("HALTED: RENDER EXCEPTION");
           isCapturing = false;
           onCompleteRef.current?.();
         }
-      };
+      });
 
-      captureLoop();
+      // Configure encoder
+      const codecsToTry = ['avc1.4d002a', 'avc1.64002a', 'avc1.42E02a', 'avc1.42E01E'];
+      let selectedCodec = '';
+      
+      (async () => {
+        for (const codec of codecsToTry) {
+          try {
+            const support = await (VideoEncoder as any).isConfigSupported({
+              codec, width, height, bitrate, framerate: fps
+            });
+            if (support.supported) {
+              selectedCodec = codec;
+              break;
+            }
+          } catch (_) { /* ignore */ }
+        }
+
+        if (!selectedCodec) {
+          selectedCodec = codecsToTry[0];
+        }
+
+        try {
+          encoder.configure({
+            codec: selectedCodec,
+            width, height,
+            bitrate,
+            framerate: fps,
+            hardwareAcceleration: 'prefer-hardware'
+          });
+          onStatusRef.current?.("ENGINE STABILIZED. BEGINNING RENDER...");
+        } catch (e: any) {
+          console.error("Encoder configuration failed:", e);
+          onStatusRef.current?.("HARDWARE INITIALIZATION FAILED");
+          isCapturing = false;
+          onCompleteRef.current?.();
+          return;
+        }
+
+        const captureLoop = async () => {
+          if (!effectActive || !isCapturing || !recCanvas || !recCtx) return;
+
+          try {
+            const timeInSeconds = currentFrame / fps;
+
+            // Render pass
+            if (contextType === '2d') {
+              const r2d = recCtx as CanvasRenderingContext2D;
+              r2d.fillStyle = '#050505';
+              r2d.fillRect(0, 0, width, height);
+            }
+
+            const output = renderFn(
+              { cols: Math.floor(width / recBaseCharWidth), rows: Math.floor(height / recBaseCharHeight), width, height, canvas: recCanvas }, 
+              timeInSeconds, 
+              repoContexts, 
+              userInput, 
+              { x: 0, y: 0, isPressed: false }, 
+              recCtx, 
+              recCanvas,
+              THREE
+            );
+
+            if (output && contextType === '2d') {
+              renderASCII(recCtx as CanvasRenderingContext2D, output, recBaseCharWidth, recBaseCharHeight, recBaseFontSize);
+            }
+
+            // Encode frame
+            const frameDuration = 1_000_000 / fps;
+            const timestamp = Math.floor(currentFrame * frameDuration);
+            const frame = new VideoFrame(recCanvas, { 
+              timestamp, 
+              duration: Math.floor(frameDuration) 
+            });
+
+            // Backpressure: Wait ONLY if the encoder is significantly overwhelmed
+            if (encoder.encodeQueueSize > 50) {
+              const startWait = Date.now();
+              let reportedStall = false;
+              while (isCapturing && encoder.encodeQueueSize > 15) {
+                await new Promise(r => setTimeout(r, 20));
+                
+                if (!reportedStall && Date.now() - startWait > 1500) {
+                  onStatusRef.current?.(`WAITING ON GPU... [${encoder.encodeQueueSize} pending]`);
+                  reportedStall = true;
+                }
+
+                if (Date.now() - startWait > 10000) {
+                   break; 
+                }
+              }
+              if (reportedStall) {
+                onStatusRef.current?.("GPU SYNCED. RESUMING...");
+              }
+            }
+            
+            if (!isCapturing) {
+              frame.close();
+              return;
+            }
+
+            encoder.encode(frame, { keyFrame: currentFrame % 60 === 0 });
+            frame.close();
+
+            currentFrame++;
+            
+            const progress = Math.floor((currentFrame / totalFrames) * 100);
+            onProgressRef.current(progress);
+            
+            const now = Date.now();
+            if (now - lastStatusUpdate > 1500) {
+              const msgIdx = Math.min(statusMessages.length - 1, Math.floor((currentFrame / totalFrames) * statusMessages.length));
+              onStatusRef.current?.(`${statusMessages[msgIdx]} (${currentFrame}/${totalFrames})`);
+              lastStatusUpdate = now;
+            }
+
+            if (currentFrame < totalFrames) {
+              if (currentFrame % 30 === 0) {
+                requestAnimationFrame(captureLoop);
+              } else {
+                setTimeout(captureLoop, 0);
+              }
+            } else {
+              onStatusRef.current?.("SEALING ALCHEMICAL CONTAINER...");
+              try {
+                onStatusRef.current?.("DRAINING HARDWARE QUEUE...");
+                let drainWait = 0;
+                while (encoder.encodeQueueSize > 0 && drainWait < 1500) {
+                  await new Promise(r => setTimeout(r, 20));
+                  drainWait++;
+                }
+                
+                const flushPromise = encoder.flush();
+                const timeoutPromise = new Promise((_, reject) => 
+                  setTimeout(() => reject(new Error("Timeout")), 20000)
+                );
+
+                try {
+                  await Promise.race([flushPromise, timeoutPromise]);
+                } catch (flushErr: any) {
+                  console.warn("Forcing finalization after flush stall:", flushErr.message);
+                }
+
+                muxer.finalize();
+                
+                const { buffer } = muxer.target as ArrayBufferTarget;
+                if (!buffer || buffer.byteLength === 0) throw new Error("Generated buffer is empty");
+
+                const blob = new Blob([buffer], { type: 'video/mp4' });
+                const url = URL.createObjectURL(blob);
+                
+                onStatusRef.current?.("ALCHEMY COMPLETE. DISPATCHING...");
+                
+                const adHocName = userInput 
+                  ? userInput.split(' ').slice(0, 3).join('_').replace(/[^a-z0-9]/gi, '_').toLowerCase() 
+                  : 'alchemical_render';
+                const timestampStr = new Date().toISOString().replace(/[:.]/g, '-');
+                const fileName = `reposcripter_${adHocName}_${timestampStr}.mp4`;
+
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fileName;
+                document.body.appendChild(a);
+                
+                setTimeout(() => {
+                  a.click();
+                  setTimeout(() => {
+                    if (document.body.contains(a)) document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    isCapturing = false;
+                    onCompleteRef.current?.();
+                  }, 1500);
+                }, 200);
+
+                if ((encoder as any).state !== 'closed') encoder.close();
+              } catch (finalizeError: any) {
+                console.error("Finalization Error:", finalizeError);
+                onStatusRef.current?.("HALTED: " + finalizeError.message);
+                isCapturing = false;
+                onCompleteRef.current?.();
+              }
+            }
+          } catch (e: any) {
+            console.error("Capture Loop Error:", e);
+            onStatusRef.current?.("HALTED: EXCEPTION");
+            isCapturing = false;
+            onCompleteRef.current?.();
+          }
+        };
+
+        captureLoop();
+      })();
     } else if (isSnapshotting && recCanvas) {
       // Snapshot Logic (High-Res PNG)
       const ratioConfig = EXPORT_RATIOS.find(r => r.value === exportRatio) || EXPORT_RATIOS[0];
