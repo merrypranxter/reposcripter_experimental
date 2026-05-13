@@ -684,12 +684,14 @@ const JS5Canvas = ({
         }
 
         try {
-          encoder.configure({
+          console.log("[EXPORT] Starting configuration with hardware acceleration...");
+          (encoder as any).configure({
             codec: selectedCodec,
             width, height,
             bitrate,
             framerate: fps,
-            hardwareAcceleration: 'no-preference'
+            hardwareAcceleration: 'prefer-hardware',
+            latencyMode: 'realtime'
           });
           onStatusRef.current?.("ENGINE STABILIZED. BEGINNING RENDER...");
         } catch (e: any) {
@@ -706,15 +708,18 @@ const JS5Canvas = ({
 
           try {
             if (currentFrame >= totalFrames) {
+              console.log("[EXPORT] Render complete. Starting finalization...");
               onStatusRef.current?.("SEALING ALCHEMICAL CONTAINER...");
               try {
                 onStatusRef.current?.("DRAINING HARDWARE QUEUE...");
+                console.log(`[EXPORT] Final queue size: ${encoder.encodeQueueSize}`);
                 let drainWait = 0;
                 while (encoder.encodeQueueSize > 0 && drainWait < 2000) {
                   await new Promise(r => setTimeout(r, 30));
                   drainWait++;
                 }
                 
+                console.log("[EXPORT] Flushing encoder...");
                 const flushPromise = encoder.flush();
                 const timeoutPromise = new Promise((_, reject) => 
                   setTimeout(() => reject(new Error("GPU Flush Timeout")), 30000)
@@ -722,12 +727,15 @@ const JS5Canvas = ({
 
                 // If flush fails or times out, we do NOT finalize (prevents corrupted MP4s)
                 await Promise.race([flushPromise, timeoutPromise]);
+                console.log("[EXPORT] Flush successful.");
 
+                console.log("[EXPORT] Finalizing muxer...");
                 muxer.finalize();
                 
                 const { buffer } = muxer.target as ArrayBufferTarget;
                 if (!buffer || buffer.byteLength === 0) throw new Error("Generated buffer is empty");
 
+                console.log(`[EXPORT] Blob created. Size: ${(buffer.byteLength / 1024 / 1024).toFixed(2)}MB`);
                 const blob = new Blob([buffer], { type: 'video/mp4' });
                 const url = URL.createObjectURL(blob);
                 
@@ -764,11 +772,11 @@ const JS5Canvas = ({
               return;
             }
 
-            // Processing burst: Render up to 2 frames if the hardware can keep up
+            // Processing burst: Render frames aggressively
             let processed = 0;
-            const maxBurst = 2;
+            const maxBurst = 40;
             
-            while (isCapturing && currentFrame < totalFrames && processed < maxBurst && encoder.encodeQueueSize < 12) {
+            while (isCapturing && currentFrame < totalFrames && processed < maxBurst && encoder.encodeQueueSize < 120) {
               const timeInSeconds = currentFrame / fps;
 
               if (contextType === '2d') {
@@ -809,6 +817,7 @@ const JS5Canvas = ({
             // Updates
             const progress = Math.floor((currentFrame / totalFrames) * 100);
             if (progress !== lastReportedProgress) {
+              if (progress % 10 === 0) console.log(`[EXPORT] Progress: ${progress}% (${currentFrame}/${totalFrames})`);
               onProgressRef.current(progress);
               lastReportedProgress = progress;
             }
@@ -822,11 +831,8 @@ const JS5Canvas = ({
 
             // Yield and reschedule
             if (isCapturing && currentFrame < totalFrames) {
-              if (encoder.encodeQueueSize > 8) {
-                // Throttle: wait for queue to drain slightly
-                await new Promise(r => setTimeout(r, 10));
-              }
-              setTimeout(captureLoop, 0);
+              const wait = encoder.encodeQueueSize > 60 ? 30 : 0;
+              setTimeout(captureLoop, wait);
             }
           } catch (e: any) {
             console.error("Capture Loop Error:", e);
