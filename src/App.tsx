@@ -684,14 +684,13 @@ const JS5Canvas = ({
         }
 
         try {
-          console.log("[EXPORT] Starting configuration with hardware acceleration...");
+          console.log(`[EXPORT] Starting configuration. Codec: ${selectedCodec}, Resolution: ${width}x${height}, FPS: ${fps}, Bitrate: ${bitrate}`);
           (encoder as any).configure({
             codec: selectedCodec,
             width, height,
             bitrate,
             framerate: fps,
-            hardwareAcceleration: 'prefer-hardware',
-            latencyMode: 'realtime'
+            hardwareAcceleration: 'no-preference'
           });
           onStatusRef.current?.("ENGINE STABILIZED. BEGINNING RENDER...");
         } catch (e: any) {
@@ -709,10 +708,10 @@ const JS5Canvas = ({
           try {
             if (currentFrame >= totalFrames) {
               console.log("[EXPORT] Render complete. Starting finalization...");
-              onStatusRef.current?.("SEALING ALCHEMICAL CONTAINER...");
+              onStatusRef.current?.("FINALIZING MP4...");
               try {
+                console.log(`[EXPORT] Draining queue. Current size: ${encoder.encodeQueueSize}`);
                 onStatusRef.current?.("DRAINING HARDWARE QUEUE...");
-                console.log(`[EXPORT] Final queue size: ${encoder.encodeQueueSize}`);
                 let drainWait = 0;
                 while (encoder.encodeQueueSize > 0 && drainWait < 2000) {
                   await new Promise(r => setTimeout(r, 30));
@@ -725,7 +724,6 @@ const JS5Canvas = ({
                   setTimeout(() => reject(new Error("GPU Flush Timeout")), 30000)
                 );
 
-                // If flush fails or times out, we do NOT finalize (prevents corrupted MP4s)
                 await Promise.race([flushPromise, timeoutPromise]);
                 console.log("[EXPORT] Flush successful.");
 
@@ -739,6 +737,7 @@ const JS5Canvas = ({
                 const blob = new Blob([buffer], { type: 'video/mp4' });
                 const url = URL.createObjectURL(blob);
                 
+                onProgressRef.current(100);
                 onStatusRef.current?.("ALCHEMY COMPLETE. DISPATCHING...");
                 
                 const adHocName = userInput 
@@ -772,11 +771,11 @@ const JS5Canvas = ({
               return;
             }
 
-            // Processing burst: Render frames aggressively
+            // Processing burst: Render frames cautiously
             let processed = 0;
-            const maxBurst = 40;
+            const maxBurst = 2;
             
-            while (isCapturing && currentFrame < totalFrames && processed < maxBurst && encoder.encodeQueueSize < 120) {
+            while (isCapturing && currentFrame < totalFrames && processed < maxBurst && encoder.encodeQueueSize < 12) {
               const timeInSeconds = currentFrame / fps;
 
               if (contextType === '2d') {
@@ -815,7 +814,7 @@ const JS5Canvas = ({
             }
 
             // Updates
-            const progress = Math.floor((currentFrame / totalFrames) * 100);
+            const progress = Math.min(99, Math.floor((currentFrame / totalFrames) * 100));
             if (progress !== lastReportedProgress) {
               if (progress % 10 === 0) console.log(`[EXPORT] Progress: ${progress}% (${currentFrame}/${totalFrames})`);
               onProgressRef.current(progress);
@@ -831,8 +830,10 @@ const JS5Canvas = ({
 
             // Yield and reschedule
             if (isCapturing && currentFrame < totalFrames) {
-              const wait = encoder.encodeQueueSize > 60 ? 30 : 0;
-              setTimeout(captureLoop, wait);
+              if (encoder.encodeQueueSize > 8) {
+                await new Promise(r => setTimeout(r, 10));
+              }
+              setTimeout(captureLoop, 0);
             }
           } catch (e: any) {
             console.error("Capture Loop Error:", e);
