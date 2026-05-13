@@ -702,33 +702,54 @@ const JS5Canvas = ({
         }
 
         let lastReportedProgress = -1;
+        let lastFrameAdvancedAt = Date.now();
+        let lastFrameCount = 0;
+
+        const withTimeout = <T,>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
+          Promise.race([
+            promise,
+            new Promise<T>((_, reject) =>
+              setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+            )
+          ]);
+
         const captureLoop = async () => {
           if (!effectActive || !isCapturing || !recCanvas || !recCtx) return;
+
+          // Watchdog: detect long stalls
+          const nowWatchdog = Date.now();
+          if (currentFrame === lastFrameCount && nowWatchdog - lastFrameAdvancedAt > 45000) {
+            console.error(`[EXPORT STALL] Frame ${currentFrame}/${totalFrames} stalled for 45s. Queue: ${encoder.encodeQueueSize}`);
+            onStatusRef.current?.(`STALL DETECTED at frame ${currentFrame}. ABORTING.`);
+            isCapturing = false;
+            onCompleteRef.current?.();
+            return;
+          }
 
           try {
             if (currentFrame >= totalFrames) {
               console.log("[EXPORT] Render complete. Starting finalization...");
               onStatusRef.current?.("FINALIZING MP4...");
               try {
-                console.log(`[EXPORT] Draining queue. Current size: ${encoder.encodeQueueSize}`);
+                console.log(`[EXPORT] Final finalization. Queue size: ${encoder.encodeQueueSize}`);
                 onStatusRef.current?.("DRAINING HARDWARE QUEUE...");
+                
+                // Drain with timeout
                 let drainWait = 0;
-                while (encoder.encodeQueueSize > 0 && drainWait < 2000) {
+                while (encoder.encodeQueueSize > 0 && drainWait < 100) { // approx 3 seconds max
                   await new Promise(r => setTimeout(r, 30));
                   drainWait++;
                 }
                 
                 console.log("[EXPORT] Flushing encoder...");
-                const flushPromise = encoder.flush();
-                const timeoutPromise = new Promise((_, reject) => 
-                  setTimeout(() => reject(new Error("GPU Flush Timeout")), 30000)
-                );
-
-                await Promise.race([flushPromise, timeoutPromise]);
+                onStatusRef.current?.("FLUSHING GPU...");
+                await withTimeout(encoder.flush(), 30000, "GPU Flush");
                 console.log("[EXPORT] Flush successful.");
 
                 console.log("[EXPORT] Finalizing muxer...");
+                onStatusRef.current?.("SEALING MP4...");
                 muxer.finalize();
+                console.log("[EXPORT] Muxer finalized.");
                 
                 const { buffer } = muxer.target as ArrayBufferTarget;
                 if (!buffer || buffer.byteLength === 0) throw new Error("Generated buffer is empty");
@@ -771,46 +792,69 @@ const JS5Canvas = ({
               return;
             }
 
-            // Processing burst: Render frames cautiously
+            // Processing burst
             let processed = 0;
             const maxBurst = 2;
             
-            while (isCapturing && currentFrame < totalFrames && processed < maxBurst && encoder.encodeQueueSize < 12) {
-              const timeInSeconds = currentFrame / fps;
+            if (encoder.encodeQueueSize < 12) {
+              while (isCapturing && currentFrame < totalFrames && processed < maxBurst && encoder.encodeQueueSize < 12) {
+                const timeInSeconds = currentFrame / fps;
 
-              if (contextType === '2d') {
-                const r2d = recCtx as CanvasRenderingContext2D;
-                r2d.fillStyle = '#050505';
-                r2d.fillRect(0, 0, width, height);
+                if (contextType === '2d') {
+                  const r2d = recCtx as CanvasRenderingContext2D;
+                  r2d.fillStyle = '#050505';
+                  r2d.fillRect(0, 0, width, height);
+                }
+
+                const output = renderFn(
+                  { cols: Math.floor(width / recBaseCharWidth), rows: Math.floor(height / recBaseCharHeight), width, height, canvas: recCanvas }, 
+                  timeInSeconds, 
+                  repoContexts, 
+                  userInput, 
+                  { x: 0, y: 0, isPressed: false }, 
+                  recCtx, 
+                  recCanvas,
+                  THREE
+                );
+
+                if (output && contextType === '2d') {
+                  renderASCII(recCtx as CanvasRenderingContext2D, output, recBaseCharWidth, recBaseCharHeight, recBaseFontSize);
+                }
+
+                const frameDuration = 1_000_000 / fps;
+                const timestamp = Math.floor(currentFrame * frameDuration);
+                const frame = new VideoFrame(recCanvas, { 
+                  timestamp, 
+                  duration: Math.floor(frameDuration) 
+                });
+
+                encoder.encode(frame, { keyFrame: currentFrame % 120 === 0 });
+                frame.close();
+
+                currentFrame++;
+                processed++;
               }
 
-              const output = renderFn(
-                { cols: Math.floor(width / recBaseCharWidth), rows: Math.floor(height / recBaseCharHeight), width, height, canvas: recCanvas }, 
-                timeInSeconds, 
-                repoContexts, 
-                userInput, 
-                { x: 0, y: 0, isPressed: false }, 
-                recCtx, 
-                recCanvas,
-                THREE
-              );
-
-              if (output && contextType === '2d') {
-                renderASCII(recCtx as CanvasRenderingContext2D, output, recBaseCharWidth, recBaseCharHeight, recBaseFontSize);
+              if (processed > 0) {
+                lastFrameAdvancedAt = Date.now();
+                lastFrameCount = currentFrame;
               }
-
-              const frameDuration = 1_000_000 / fps;
-              const timestamp = Math.floor(currentFrame * frameDuration);
-              const frame = new VideoFrame(recCanvas, { 
-                timestamp, 
-                duration: Math.floor(frameDuration) 
-              });
-
-              encoder.encode(frame, { keyFrame: currentFrame % 120 === 0 });
-              frame.close();
-
-              currentFrame++;
-              processed++;
+            } else {
+              // Queue is full, show waiting status
+              if (nowWatchdog - lastStatusUpdate > 2000) {
+                onStatusRef.current?.(`WAITING FOR GPU QUEUE (${encoder.encodeQueueSize})... ${currentFrame}/${totalFrames}`);
+                lastStatusUpdate = nowWatchdog;
+              }
+              
+              // If stalled with full queue for more than 10 seconds, try a recovery flush
+              if (nowWatchdog - lastFrameAdvancedAt > 10000) {
+                 console.log(`[EXPORT] Queue stall detected (${encoder.encodeQueueSize}). Attempting recovery flush...`);
+                 try {
+                   await withTimeout(encoder.flush(), 5000, "Recovery Flush");
+                 } catch (e: any) {
+                   console.warn("Recovery flush failed or timed out:", e.message);
+                 }
+              }
             }
 
             // Updates
@@ -822,9 +866,9 @@ const JS5Canvas = ({
             }
             
             const now = Date.now();
-            if (now - lastStatusUpdate > 2000) {
+            if (now - lastStatusUpdate > 3000) {
               const msgIdx = Math.min(statusMessages.length - 1, Math.floor((currentFrame / totalFrames) * statusMessages.length));
-              onStatusRef.current?.(`${statusMessages[msgIdx]} (${currentFrame}/${totalFrames})`);
+              onStatusRef.current?.(`${statusMessages[msgIdx]} (${currentFrame}/${totalFrames}) [Queue: ${encoder.encodeQueueSize}]`);
               lastStatusUpdate = now;
             }
 
@@ -837,7 +881,7 @@ const JS5Canvas = ({
             }
           } catch (e: any) {
             console.error("Capture Loop Error:", e);
-            onStatusRef.current?.("HALTED: EXCEPTION");
+            onStatusRef.current?.("HALTED: EXCEPTION during loop");
             isCapturing = false;
             onCompleteRef.current?.();
           }
