@@ -36,7 +36,14 @@ import {
   Copy,
   Plus,
   Search,
-  Archive
+  Archive,
+  Folder,
+  Edit2,
+  Palette,
+  ArrowUp,
+  ArrowDown,
+  FolderPlus,
+  MoveVertical
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as THREE from 'three';
@@ -138,9 +145,64 @@ interface AppState {
   exportStatus: string;
   isReactorCollapsed: boolean;
   // Archive
-  archiveFiles: { name: string; path: string; sha: string }[];
+  archiveFiles: { name: string; path: string; sha: string; folder?: string; color?: string; order?: number; alias?: string }[];
+  archiveFolders: string[];
+  archiveMetadata: any; 
   isLoadingArchive: boolean;
+  lastArchiveLoadedPath: string | null;
+  exportFilename: string;
+  exportAutoSuffix: boolean;
+  exportSuccessMessage: string;
+  recipeTitle: string;
+  isLowPowerMode?: boolean;
 }
+
+// --- Attribute and Uniform Sanitization for Three.js ShaderMaterial ---
+const sanitizeShader = (shaderCode: string | undefined): string | undefined => {
+  if (!shaderCode) return shaderCode;
+  let sanitized = shaderCode;
+  
+  // Strip duplicate input attribute declarations that Three.js defines internally in WebGL2/GLSL3.0
+  sanitized = sanitized.replace(/^\s*(in|attribute)\s+vec3\s+position\s*;\s*$/gm, '');
+  sanitized = sanitized.replace(/^\s*(in|attribute)\s+vec2\s+uv\s*;\s*$/gm, '');
+  sanitized = sanitized.replace(/^\s*(in|attribute)\s+vec3\s+normal\s*;\s*$/gm, '');
+  sanitized = sanitized.replace(/^\s*(in|attribute)\s+vec4\s+skinIndex\s*;\s*$/gm, '');
+  sanitized = sanitized.replace(/^\s*(in|attribute)\s+vec4\s+skinWeight\s*;\s*$/gm, '');
+
+  // Strip standard uniforms if they are redeclared
+  sanitized = sanitized.replace(/^\s*uniform\s+mat4\s+projectionMatrix\s*;\s*$/gm, '');
+  sanitized = sanitized.replace(/^\s*uniform\s+mat4\s+modelViewMatrix\s*;\s*$/gm, '');
+  sanitized = sanitized.replace(/^\s*uniform\s+mat4\s+modelMatrix\s*;\s*$/gm, '');
+  sanitized = sanitized.replace(/^\s*uniform\s+mat4\s+viewMatrix\s*;\s*$/gm, '');
+  sanitized = sanitized.replace(/^\s*uniform\s+mat3\s+normalMatrix\s*;\s*$/gm, '');
+  sanitized = sanitized.replace(/^\s*uniform\s+vec3\s+cameraPosition\s*;\s*$/gm, '');
+
+  return sanitized;
+};
+
+const WrappedTHREE = new Proxy(THREE, {
+  get(target, prop, receiver) {
+    if (prop === 'ShaderMaterial') {
+      return class CustomShaderMaterial extends THREE.ShaderMaterial {
+        constructor(parameters?: any) {
+          if (parameters) {
+            const modifiedParams = { ...parameters };
+            if (modifiedParams.vertexShader) {
+              modifiedParams.vertexShader = sanitizeShader(modifiedParams.vertexShader);
+            }
+            if (modifiedParams.fragmentShader) {
+              modifiedParams.fragmentShader = sanitizeShader(modifiedParams.fragmentShader);
+            }
+            super(modifiedParams);
+          } else {
+            super();
+          }
+        }
+      };
+    }
+    return Reflect.get(target, prop, receiver);
+  }
+});
 
 // --- Constants ---
 const EXPORT_RATIOS = [
@@ -172,6 +234,17 @@ function fromBase64(base64: string) {
     bytes[i] = binary.charCodeAt(i);
   }
   return new TextDecoder().decode(bytes);
+}
+
+function patchWebGLContext(gl: any) {
+  if (gl && gl.getContextAttributes) {
+    const originalGetContextAttributes = gl.getContextAttributes;
+    gl.getContextAttributes = function() {
+      const attrs = originalGetContextAttributes.call(this);
+      return attrs || { alpha: true, antialias: true, depth: true, preserveDrawingBuffer: true };
+    };
+  }
+  return gl;
 }
 
 async function getRepos(username: string, token?: string) {
@@ -391,16 +464,31 @@ const JS5Canvas = ({
     // Get context based on detected type. 
     const ctx = contextType === '2d' 
       ? canvas.getContext('2d') 
-      : canvas.getContext('webgl2', { alpha: true, antialias: true, preserveDrawingBuffer: true });
+      : patchWebGLContext(
+          canvas.getContext('webgl2', { alpha: true, antialias: true, preserveDrawingBuffer: true })
+        );
     
     const recCanvas = recordingCanvasRef.current;
-    const recCtx = recCanvas 
-      ? (contextType === '2d' ? recCanvas.getContext('2d') : recCanvas.getContext('webgl2', { alpha: true, antialias: true, preserveDrawingBuffer: true }))
+    const recCtx = (recCanvas && (isRecording || isExportingVideo || isSnapshotting))
+      ? (contextType === '2d' 
+         ? recCanvas.getContext('2d') 
+         : patchWebGLContext(
+             recCanvas.getContext('webgl2', { alpha: true, antialias: true, preserveDrawingBuffer: true })
+           ))
       : null;
     
     if (!ctx) {
-      setError(`Could not get ${contextType} context.`);
+      setError(`Could not get ${contextType} context. Your browser or machine graphics card might not support WebGL 2, or hardware acceleration is disabled. Try enabling Low-Power Mode in Settings to force standard 2D canvas rendering.`);
       return;
+    }
+
+    const handleContextLost = (e: Event) => {
+      e.preventDefault();
+      setError("WebGL Context Lost: Your machine's graphics processor was overloaded by the complexity of the generated math and restarted. Try turning on Low-Power / Safe Mode in Settings, selecting fewer repositories, or writing a simpler art prompt.");
+    };
+
+    if (contextType === 'webgl2') {
+      canvas.addEventListener('webglcontextlost', handleContextLost);
     }
 
     const baseFontSize = 12;
@@ -508,7 +596,7 @@ const JS5Canvas = ({
             mouse, 
             recCtx, 
             recCanvas,
-            THREE
+            WrappedTHREE
           );
           if (output && contextType === '2d') {
             renderASCII(recCtx as CanvasRenderingContext2D, output, recBaseCharWidth, recBaseCharHeight, recBaseFontSize);
@@ -517,6 +605,16 @@ const JS5Canvas = ({
           console.error("Recording Render Error:", e);
         }
       }
+
+      const originalConsoleError = console.error;
+      let lastConsoleError: string | null = null;
+      console.error = (...args) => {
+        originalConsoleError.apply(console, args);
+        const msg = args.map(arg => (arg && arg.stack) ? arg.stack : String(arg)).join(' ');
+        if (msg.includes('THREE.WebGLShader') || msg.includes('THREE.WebGLProgram') || msg.includes('shader error') || msg.includes('WebGL Initialization Failed')) {
+          lastConsoleError = msg;
+        }
+      };
 
       try {
         const output = renderFn(
@@ -527,19 +625,26 @@ const JS5Canvas = ({
           mouse, 
           ctx, 
           canvas,
-          THREE
+          WrappedTHREE
         );
+        if (lastConsoleError) {
+          throw new Error(lastConsoleError);
+        }
         if (output && contextType === '2d') {
           renderASCII(ctx as CanvasRenderingContext2D, output, baseCharWidth, baseCharHeight, baseFontSize);
         }
         if (error) setError(null);
       } catch (e: any) {
-        console.error("Render Error:", e);
+        originalConsoleError("Render Error:", e);
         if (e.message?.includes('precision')) {
           setError("WebGL Context Error: The browser could not create a WebGL context. Try refreshing or closing other tabs.");
+        } else if (e.message?.includes('fragColor') || e.message?.includes('undeclared identifier')) {
+          setError(`Runtime Error: ${e.message}. Tip: When using WebGL 2, ensure you declare 'out vec4 fragColor;' in your fragment shader and set 'glslVersion: THREE.GLSL3' in your ShaderMaterial.`);
         } else {
           setError(`Runtime Error: ${e.message}`);
         }
+      } finally {
+        console.error = originalConsoleError;
       }
     };
 
@@ -649,7 +754,7 @@ const JS5Canvas = ({
       const muxer = new Muxer({
         target: new ArrayBufferTarget(),
         video: { codec: 'avc', width, height },
-        fastStart: 'in-memory'
+        fastStart: false
       });
 
       const encoder = new VideoEncoder({
@@ -746,7 +851,7 @@ const JS5Canvas = ({
                 await withTimeout(encoder.flush(), 30000, "GPU Flush");
                 console.log("[EXPORT] Flush successful.");
 
-                console.log("[EXPORT] Finalizing muxer...");
+                console.log("[EXPORT] Finalizing muxer with fastStart disabled");
                 onStatusRef.current?.("SEALING MP4...");
                 muxer.finalize();
                 console.log("[EXPORT] Muxer finalized.");
@@ -792,7 +897,7 @@ const JS5Canvas = ({
               return;
             }
 
-            // Processing burst
+        // Processing burst
             let processed = 0;
             const maxBurst = 2;
             
@@ -814,7 +919,7 @@ const JS5Canvas = ({
                   { x: 0, y: 0, isPressed: false }, 
                   recCtx, 
                   recCanvas,
-                  THREE
+                  WrappedTHREE
                 );
 
                 if (output && contextType === '2d') {
@@ -874,8 +979,8 @@ const JS5Canvas = ({
 
             // Yield and reschedule
             if (isCapturing && currentFrame < totalFrames) {
-              if (encoder.encodeQueueSize > 8) {
-                await new Promise(r => setTimeout(r, 10));
+              if (encoder.encodeQueueSize > 100) {
+                await new Promise(r => setTimeout(r, 30));
               }
               setTimeout(captureLoop, 0);
             }
@@ -910,7 +1015,7 @@ const JS5Canvas = ({
           { x: 0, y: 0, isPressed: false }, 
           recCtx, 
           recCanvas,
-          THREE
+          WrappedTHREE
         );
 
         if (output && contextType === '2d') {
@@ -958,11 +1063,34 @@ const JS5Canvas = ({
       window.removeEventListener('mousedown', handleMouseDown);
       window.removeEventListener('mouseup', handleMouseUp);
       
+      if (canvas && contextType === 'webgl2') {
+        canvas.removeEventListener('webglcontextlost', handleContextLost);
+      }
+
       if ((canvas as any).__three) {
         const three = (canvas as any).__three;
         if (three.renderer) {
           try {
+            if (three.scene) {
+              three.scene.traverse((object: any) => {
+                if (object.geometry) object.geometry.dispose();
+                if (object.material) {
+                  if (Array.isArray(object.material)) {
+                    object.material.forEach((mat: any) => mat.dispose());
+                  } else {
+                    object.material.dispose();
+                  }
+                }
+              });
+            }
             three.renderer.dispose();
+            if (canvas) {
+              const gl = three.renderer.getContext();
+              if (gl) {
+                const ext = gl.getExtension('WEBGL_lose_context');
+                if (ext) ext.loseContext();
+              }
+            }
           } catch (e) {}
         }
         delete (canvas as any).__three;
@@ -972,7 +1100,26 @@ const JS5Canvas = ({
         const three = (recCanvas as any).__three;
         if (three.renderer) {
           try {
+            if (three.scene) {
+              three.scene.traverse((object: any) => {
+                if (object.geometry) object.geometry.dispose();
+                if (object.material) {
+                  if (Array.isArray(object.material)) {
+                    object.material.forEach((mat: any) => mat.dispose());
+                  } else {
+                    object.material.dispose();
+                  }
+                }
+              });
+            }
             three.renderer.dispose();
+            if (recCanvas) {
+              const gl = three.renderer.getContext();
+              if (gl) {
+                const ext = gl.getExtension('WEBGL_lose_context');
+                if (ext) ext.loseContext();
+              }
+            }
           } catch (e) {}
         }
         delete (recCanvas as any).__three;
@@ -1188,6 +1335,17 @@ const PromptPanel = ({ state, setState, handleGenerate, handleSaveToLibrary, pro
 
   return (
     <div className="flex flex-col gap-6">
+      <div className="flex flex-col gap-2">
+        <label className="text-[0.6rem] uppercase tracking-widest text-muted">Recipe Title</label>
+        <input 
+          type="text"
+          placeholder="e.g. Neon Spiral Drift (Optional)"
+          className="w-full bg-bg border border-border focus:border-accent text-xs p-2.5 text-white placeholder-muted/30 font-mono focus:outline-none"
+          value={state.recipeTitle || ''}
+          onChange={e => setState((s: any) => ({ ...s, recipeTitle: e.target.value }))}
+        />
+      </div>
+
       <div className="flex flex-col gap-2 relative">
         <label className="text-[0.6rem] uppercase tracking-widest text-muted flex justify-between">
           <span>Art Direction</span>
@@ -1196,7 +1354,7 @@ const PromptPanel = ({ state, setState, handleGenerate, handleSaveToLibrary, pro
             className="text-accent hover:text-white transition-colors flex items-center gap-1 lowercase italic"
             disabled={!state.artPrompt}
           >
-            <Plus className="w-2.5 h-2.5" /> Save to Library
+            <Plus className="w-2.5 h-2.5" /> Save Recipe
           </button>
         </label>
         <textarea 
@@ -1306,65 +1464,264 @@ const HistoryPanel = ({ history, user, handleLogin, setState, setRepoContexts, h
   </div>
 );
 
-const ArchivePanel = ({ state, setState, handleLoadArchive, handleLoadArchiveFile }: any) => {
+const ArchivePanel = ({ 
+  state, 
+  setState, 
+  handleLoadArchive, 
+  handleLoadArchiveFile,
+  handleRenameArchiveFile,
+  handleMoveFileToFolder,
+  handleSetFileColor,
+  handleReorderArchiveFile,
+  handleCreateArchiveFolder,
+  handleRemoveArchiveFolder
+}: any) => {
+  const [editingPath, setEditingPath] = useState<string | null>(null);
+  const [editName, setEditName] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [showFolderInput, setShowFolderInput] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (state.lastArchiveLoadedPath && listRef.current) {
+      // Small delay to ensure the list is rendered, especially folders/filters
+      const timer = setTimeout(() => {
+        const activeEl = listRef.current?.querySelector(`[data-path="${state.lastArchiveLoadedPath}"]`);
+        if (activeEl) {
+          activeEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        }
+      }, 300);
+      return () => clearTimeout(timer);
+    }
+  }, [state.lastArchiveLoadedPath]);
+
+  const colors = [
+    { name: 'none', value: '' },
+    { name: 'cyan', value: '#00e5ff' },
+    { name: 'magenta', value: '#ff00ff' },
+    { name: 'yellow', value: '#ffff00' },
+    { name: 'red', value: '#ff3d00' },
+    { name: 'green', value: '#00e676' },
+  ];
+
+  const filteredFiles = state.archiveFiles.filter((f: any) => 
+    (f.alias || f.name).toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  const folders = [...state.archiveFolders];
+  const rootFiles = filteredFiles.filter((f: any) => !f.folder);
+
+  const ArchiveItem = ({ file }: { file: any, key?: any }) => (
+    <div 
+      data-path={file.path}
+      className={`bg-bg border border-border p-3 hover:border-accent transition-all group flex flex-col gap-2 relative ${state.lastArchiveLoadedPath === file.path ? 'ring-1 ring-accent bg-accent/5' : ''}`}
+      style={{ borderLeftColor: file.color || undefined, borderLeftWidth: file.color ? '4px' : undefined }}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex-1 min-w-0" onClick={() => handleLoadArchiveFile(file.path)}>
+          {editingPath === file.path ? (
+            <input 
+              autoFocus
+              className="w-full bg-panel border border-accent text-[0.7rem] px-2 py-1 outline-none"
+              value={editName}
+              onChange={e => setEditName(e.target.value)}
+              onBlur={() => {
+                handleRenameArchiveFile(file.path, editName);
+                setEditingPath(null);
+              }}
+              onKeyDown={e => {
+                if (e.key === 'Enter') {
+                  handleRenameArchiveFile(file.path, editName);
+                  setEditingPath(null);
+                }
+              }}
+            />
+          ) : (
+            <div className={`text-[0.7rem] font-mono truncate cursor-pointer ${file.alias ? 'text-white' : 'text-accent2'} group-hover:text-accent`}>
+              {file.alias || file.name}
+            </div>
+          )}
+          <div className="text-[0.45rem] text-muted flex items-center gap-2 mt-0.5">
+            <span className="uppercase tracking-widest truncate max-w-[120px]">{file.path}</span>
+            <span className="opacity-20">|</span>
+            <span>{file.sha.slice(0, 7)}</span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button 
+            onClick={() => { setEditingPath(file.path); setEditName(file.alias || file.name); }}
+            className="p-1 hover:text-accent transition-colors" title="Rename"
+          >
+            <Edit2 className="w-3 h-3" />
+          </button>
+          <div className="relative group/palette">
+            <button className="p-1 hover:text-accent transition-colors" title="Color Code">
+              <Palette className="w-3 h-3" />
+            </button>
+            <div className="absolute top-full right-0 mt-1 hidden group-hover/palette:flex bg-panel border border-border p-1 gap-1 z-50 rounded shadow-xl">
+              {colors.map(c => (
+                <button 
+                  key={c.name}
+                  className="w-4 h-4 rounded-full border border-white/10 hover:scale-110 transition-transform"
+                  style={{ backgroundColor: c.value || 'transparent' }}
+                  onClick={() => handleSetFileColor(file.path, c.value)}
+                />
+              ))}
+            </div>
+          </div>
+          <div className="relative group/move">
+            <button className="p-1 hover:text-accent transition-colors" title="Move to Folder">
+              <FolderPlus className="w-3 h-3" />
+            </button>
+            <div className="absolute top-full right-0 mt-1 hidden group-hover/move:flex flex-col bg-panel border border-border p-1 z-50 rounded shadow-xl min-w-[100px]">
+              <button 
+                className="text-[0.6rem] px-2 py-1 hover:bg-white/10 text-left"
+                onClick={() => handleMoveFileToFolder(file.path, '')}
+              >
+                [Root]
+              </button>
+              {folders.map(f => (
+                <button 
+                  key={f}
+                  className="text-[0.6rem] px-2 py-1 hover:bg-white/10 text-left truncate"
+                  onClick={() => handleMoveFileToFolder(file.path, f)}
+                >
+                  {f}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex flex-col gap-0.5">
+            <button onClick={() => handleReorderArchiveFile(file.path, 'up')} className="p-0.5 hover:text-accent"><ArrowUp className="w-2.5 h-2.5" /></button>
+            <button onClick={() => handleReorderArchiveFile(file.path, 'down')} className="p-0.5 hover:text-accent"><ArrowDown className="w-2.5 h-2.5" /></button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <div className="flex flex-col gap-4">
       {!state.ghToken ? (
         <div className="text-center py-10 text-muted text-[0.65rem] uppercase tracking-widest opacity-30"> GitHub Token Required </div>
       ) : (
         <>
-          <div className="flex flex-col gap-2">
-            <label className="text-[0.6rem] uppercase tracking-widest text-muted">Archive Repository Owner</label>
-            <input 
-              type="text"
-              value={state.ghUser}
-              placeholder="e.g. merrypranxter"
-              onChange={e => setState((s: any) => ({ ...s, ghUser: e.target.value }))}
-              className="bg-bg border border-border px-3 py-2 text-[0.7rem] font-mono text-accent2 focus:border-accent outline-none transition-all placeholder:opacity-30"
-            />
-            <div className="text-[0.5rem] text-muted-foreground/50 leading-relaxed">
-              Default is your username. Enter a custom owner if the archive lives elsewhere.
+          <div className="flex flex-col gap-3">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted/50" />
+              <input 
+                type="text"
+                placeholder="Search archive..."
+                className="w-full bg-bg border border-border pl-10 pr-4 py-2 text-[0.7rem] focus:border-accent outline-none"
+                value={searchTerm}
+                onChange={e => setSearchTerm(e.target.value)}
+              />
             </div>
+
+            <div className="flex gap-2">
+              <button 
+                onClick={handleLoadArchive}
+                disabled={state.isLoadingArchive}
+                className="flex-[2] bg-accent2 text-bg py-2 text-[0.7rem] font-bold uppercase tracking-widest hover:bg-white transition-all disabled:opacity-50"
+              >
+                {state.isLoadingArchive ? <Loader2 className="animate-spin w-4 h-4 mx-auto" /> : 'Sync Archive'}
+              </button>
+              <button 
+                onClick={() => setShowFolderInput(!showFolderInput)}
+                className="flex-1 bg-bg border border-border text-muted py-2 text-[0.7rem] flex items-center justify-center gap-2 hover:border-accent hover:text-accent transition-all"
+              >
+                <FolderPlus className="w-4 h-4" />
+              </button>
+            </div>
+
+            <AnimatePresence>
+              {showFolderInput && (
+                <motion.div 
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  className="overflow-hidden"
+                >
+                  <div className="flex gap-1 p-1 bg-panel border border-border rounded">
+                    <input 
+                      autoFocus
+                      className="flex-1 bg-bg border border-border text-[0.7rem] p-1.5 outline-none"
+                      placeholder="Folder name..."
+                      value={newFolderName}
+                      onChange={e => setNewFolderName(e.target.value)}
+                    />
+                    <button 
+                      onClick={() => {
+                        handleCreateArchiveFolder(newFolderName);
+                        setNewFolderName('');
+                        setShowFolderInput(false);
+                      }}
+                      className="bg-accent text-bg px-3 py-1 text-[0.65rem] font-bold uppercase"
+                    >
+                      Add
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
 
-          <button 
-            onClick={handleLoadArchive}
-            disabled={state.isLoadingArchive}
-            className="bg-accent2 text-bg py-2 text-[0.7rem] font-bold uppercase tracking-widest hover:bg-white transition-all disabled:opacity-50"
-          >
-            {state.isLoadingArchive ? <Loader2 className="animate-spin w-4 h-4 mx-auto" /> : 'Synchronize Archive'}
-          </button>
-
-          {state.archiveFiles.length === 0 ? (
-            <div className="text-center py-10 text-muted text-[0.65rem] uppercase tracking-widest opacity-30 flex flex-col gap-3">
-              <span>{state.isLoadingArchive ? 'Synchronizing...' : 'No relevant files found'}</span>
-              <div className="flex flex-col gap-1 text-[0.5rem] normal-case text-muted/40">
-                <span>Looking in: {state.ghUser || 'merrypranxter'}/repo_script_js5_code</span>
-                <span>Searching for: .js, .js5, .txt, .glsl</span>
-                {state.status.includes('failed') && <span className="text-accent3/50">{state.status}</span>}
-              </div>
-            </div>
-          ) : (
-            <div className="flex flex-col gap-2">
-               <label className="text-[0.6rem] uppercase tracking-widest text-muted">Stored Alchemies ({state.archiveFiles.length})</label>
-               <div className="flex flex-col gap-2 max-h-[60vh] overflow-y-auto custom-scrollbar pr-2">
-                {state.archiveFiles.map((file: any, idx: number) => (
-                  <button 
-                    key={`archive-${file.path}-${idx}`}
-                    onClick={() => handleLoadArchiveFile(file.path)}
-                    className="w-full text-left bg-bg border border-border p-3 hover:border-accent transition-all group flex flex-col gap-1"
-                  >
-                    <div className="text-[0.7rem] font-mono text-accent2 group-hover:text-accent truncate">{file.name}</div>
-                    <div className="text-[0.5rem] text-muted flex items-center gap-2">
-                      <span className="uppercase tracking-widest">Path: {file.path}</span>
-                      <span className="opacity-30">|</span>
-                      <span>SHA: {file.sha.slice(0, 7)}</span>
+          <div ref={listRef} className="flex flex-col gap-6 max-h-[70vh] overflow-y-auto custom-scrollbar pr-2 mt-2">
+            {/* Folders */}
+            {folders.map(folder => {
+              const folderFiles = filteredFiles.filter((f: any) => f.folder === folder);
+              if (folderFiles.length === 0 && searchTerm) return null;
+              
+              return (
+                    <div key={folder} className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between gap-2 text-[0.6rem] uppercase tracking-widest text-accent font-bold border-l-2 border-accent pl-2">
+                    <div className="flex items-center gap-2">
+                      <Folder className="w-3 h-3" />
+                      <span>{folder} ({folderFiles.length})</span>
                     </div>
-                  </button>
+                    <button 
+                      onClick={() => handleRemoveArchiveFolder(folder)}
+                      className="opacity-20 hover:opacity-100 hover:text-accent3 transition-all"
+                      title="Delete Folder (files will be moved to Root)"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  </div>
+                  <div className="flex flex-col gap-2 pl-4">
+                    {folderFiles.length === 0 ? (
+                      <div className="text-[0.55rem] text-muted italic opacity-30 py-2">Empty folder</div>
+                    ) : (
+                      folderFiles.map((file: any) => (
+                        <ArchiveItem key={file.path} file={file} />
+                      ))
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+
+            {/* Root Files */}
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2 text-[0.6rem] uppercase tracking-widest text-muted font-bold border-l-2 border-border pl-2">
+                <Globe className="w-3 h-3" />
+                <span>Unorganized ({rootFiles.length})</span>
+              </div>
+              <div className="flex flex-col gap-2 pl-4">
+                {rootFiles.map((file: any) => (
+                  <ArchiveItem key={file.path} file={file} />
                 ))}
               </div>
             </div>
-          )}
+
+            {state.archiveFiles.length === 0 && !state.isLoadingArchive && (
+              <div className="text-center py-10 text-muted-foreground/30 flex flex-col gap-2 italic text-[0.65rem]">
+                <span>Archive is silent.</span>
+                <span>Push your first alchemy to begin.</span>
+              </div>
+            )}
+          </div>
         </>
       )}
     </div>
@@ -1374,19 +1731,49 @@ const ArchivePanel = ({ state, setState, handleLoadArchive, handleLoadArchiveFil
 const PromptLibraryPanel = ({ prompts, setState, handleDeletePrompt }: any) => (
   <div className="flex flex-col gap-4">
     {prompts.length === 0 ? (
-      <div className="text-center py-10 text-muted text-[0.65rem] uppercase tracking-widest opacity-30">Library Empty</div>
+      <div className="text-center py-10 text-muted text-[0.65rem] uppercase tracking-widest opacity-30">Recipe Book Empty</div>
     ) : (
       <div className="flex flex-col gap-3">
         {prompts.map((p: any, idx: number) => (
           <div key={`lib-p-${p.id || idx}-${idx}`} className="bg-bg border border-border p-3 hover:border-accent transition-colors cursor-pointer group"
             onClick={() => {
-              setState((s: any) => ({ ...s, artPrompt: p.text, activePanel: 'prompt' }));
+              setState((s: any) => {
+                const nextState = { ...s, artPrompt: p.text, activePanel: 'prompt' };
+                if (p.selectedRepos) {
+                  nextState.selectedRepos = p.selectedRepos;
+                }
+                if (p.entropy !== undefined) {
+                  nextState.entropy = p.entropy;
+                }
+                return nextState;
+              });
             }}
           >
             <div className="flex items-start justify-between gap-3">
               <div className="flex-1">
-                <div className="text-[0.7rem] font-bold text-accent2 mb-1 uppercase tracking-wider">{p.title || 'Untitled Prompt'}</div>
+                <div className="text-[0.7rem] font-bold text-accent2 mb-1 uppercase tracking-wider">{p.title || 'Untitled Recipe'}</div>
                 <div className="text-[0.7rem] leading-relaxed line-clamp-3 italic text-muted">"{p.text}"</div>
+                
+                {/* Recipe Details if present */}
+                {((p.selectedRepos && p.selectedRepos.length > 0) || p.entropy !== undefined) && (
+                  <div className="mt-3 pt-2 border-t border-border/30 flex flex-wrap gap-2 items-center text-[0.55rem] font-mono">
+                    {p.entropy !== undefined && (
+                      <span className="bg-accent/5 border border-accent/20 px-1.5 py-0.5 rounded-sm text-accent">
+                        H:{Math.round(p.entropy * 100)}%
+                      </span>
+                    )}
+                    {p.selectedRepos && p.selectedRepos.length > 0 && (
+                      <span className="bg-accent2/5 border border-accent2/20 px-1.5 py-0.5 rounded-sm text-accent2 flex items-center gap-1">
+                        <span className="text-[0.6rem] shrink-0">⏀</span> {p.selectedRepos.length} Repos
+                      </span>
+                    )}
+                  </div>
+                )}
+                {p.selectedRepos && p.selectedRepos.length > 0 && (
+                  <div className="mt-1 text-[0.52rem] font-mono text-muted/40 truncate max-w-[280px]">
+                    {p.selectedRepos.map((r: any) => r.name).join(', ')}
+                  </div>
+                )}
               </div>
               <div className="flex flex-col gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                 <button 
@@ -1395,14 +1782,14 @@ const PromptLibraryPanel = ({ prompts, setState, handleDeletePrompt }: any) => (
                     navigator.clipboard.writeText(p.text);
                   }}
                   className="p-1.5 text-muted hover:text-accent transition-all"
-                  title="Copy to Clipboard"
+                  title="Copy Prompt to Clipboard"
                 >
                   <Copy className="w-3.5 h-3.5" />
                 </button>
                 <button 
                   onClick={(e) => { e.stopPropagation(); handleDeletePrompt(p.id); }}
                   className="p-1.5 text-muted hover:text-accent3 transition-all"
-                  title="Delete from Library"
+                  title="Discard Recipe"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
@@ -1431,6 +1818,24 @@ const SettingsPanel = ({ state, setState, user, handleLogout, handleLogin }: any
       ) : (
         <button onClick={handleLogin} className="bg-accent text-bg py-2 text-[0.7rem] font-bold uppercase">Sign In with Google</button>
       )}
+    </div>
+
+    <div className="flex flex-col gap-2">
+      <label className="text-[0.6rem] uppercase tracking-widest text-muted">Performance</label>
+      <div className="bg-bg border border-border p-3 flex flex-col gap-2">
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input 
+            type="checkbox" 
+            checked={!!state.isLowPowerMode} 
+            onChange={e => setState((s: any) => ({ ...s, isLowPowerMode: e.target.checked }))}
+            className="rounded border-border text-accent focus:ring-accent bg-bg"
+          />
+          <span className="text-[0.65rem] uppercase tracking-wider font-bold text-white">Low-Power / Safe Mode</span>
+        </label>
+        <p className="text-[0.55rem] text-muted leading-normal pl-5">
+          Forces simpler generative formulas, reduces noise octaves, and instructs the alchemist to generate highly optimized standard 2D context drawings or ultra-lightweight WebGL. Enable this if you experience black screens or crashes on older GPUs.
+        </p>
+      </div>
     </div>
 
     <div className="flex flex-col gap-2">
@@ -1595,8 +2000,30 @@ const ExportPanel = ({ state, setState, handleStartRecording, handleStopRecordin
         <p className="text-[0.65rem] text-muted">
           Push the generated JS5 code to your dedicated art repository:
           <br/>
-          <span className="text-accent2">{state.ghUser || 'your-username'}/repo_script_js5_code</span>
+          <span className="text-accent2">{state.ghUser || 'merrypranxter'}/shader_files_2</span>
         </p>
+
+        <div className="flex flex-col gap-2">
+          <label className="text-[0.55rem] uppercase tracking-widest text-muted/60">Filename / Title (Optional)</label>
+          <input 
+            type="text"
+            placeholder="e.g. spiral-gravity"
+            className="w-full bg-bg border border-border focus:border-accent text-xs p-2 text-white placeholder-muted/30 font-mono focus:outline-none"
+            value={state.exportFilename || ''}
+            onChange={e => setState((s: any) => ({ ...s, exportFilename: e.target.value }))}
+          />
+          <label className="flex items-center gap-2 cursor-pointer mt-1 select-none">
+            <input 
+              type="checkbox"
+              className="accent-accent2 w-3.5 h-3.5 cursor-pointer"
+              checked={!!state.exportAutoSuffix}
+              onChange={e => setState((s: any) => ({ ...s, exportAutoSuffix: e.target.checked }))}
+            />
+            <span className="text-[0.55rem] uppercase tracking-wider text-muted">
+              Auto-append unique timestamp
+            </span>
+          </label>
+        </div>
         
         <button 
           onClick={handleGitHubExport}
@@ -1615,6 +2042,16 @@ const ExportPanel = ({ state, setState, handleStartRecording, handleStopRecordin
             </>
           )}
         </button>
+
+        {state.exportSuccessMessage && (
+          <div className={`text-[0.6rem] font-mono p-2.5 border uppercase tracking-wide leading-relaxed break-all ${
+            state.exportSuccessMessage.startsWith('✓') 
+              ? 'bg-accent/5 border-accent text-accent' 
+              : 'bg-accent3/5 border-accent3/30 text-accent3'
+          }`}>
+            {state.exportSuccessMessage}
+          </div>
+        )}
       </div>
     </div>
   </div>
@@ -1693,7 +2130,7 @@ const AuthModal = ({ isOpen, onClose, user, handleLogin, handleLogout, state, se
 function AppContent() {
   const [state, setState] = useState<AppState>({
     ghToken: '',
-    ghUser: '',
+    ghUser: 'merrypranxter',
     repoSearch: '',
     selectedRepos: [],
     repos: [],
@@ -1720,7 +2157,15 @@ function AppContent() {
     exportStatus: '',
     isReactorCollapsed: false,
     archiveFiles: [],
+    archiveFolders: [],
+    archiveMetadata: {},
     isLoadingArchive: false,
+    lastArchiveLoadedPath: null,
+    exportFilename: '',
+    exportAutoSuffix: true,
+    exportSuccessMessage: '',
+    recipeTitle: '',
+    isLowPowerMode: false,
   });
 
   const [hasKey, setHasKey] = useState<boolean | null>(null);
@@ -1796,7 +2241,37 @@ function AppContent() {
       }
     }
     testConnection();
+
+    // Load GitHub credentials from localStorage on mount
+    const savedToken = localStorage.getItem('reposcripter_gh_token');
+    const savedUser = localStorage.getItem('reposcripter_gh_user');
+    setState(s => ({
+      ...s,
+      ghToken: savedToken || s.ghToken || '',
+      ghUser: savedUser || s.ghUser || 'merrypranxter'
+    }));
   }, []);
+
+  // Save GitHub credentials when they change
+  useEffect(() => {
+    if (state.ghToken !== undefined) {
+      if (state.ghToken) {
+        localStorage.setItem('reposcripter_gh_token', state.ghToken);
+      } else {
+        localStorage.removeItem('reposcripter_gh_token');
+      }
+    }
+  }, [state.ghToken]);
+
+  useEffect(() => {
+    if (state.ghUser !== undefined) {
+      if (state.ghUser) {
+        localStorage.setItem('reposcripter_gh_user', state.ghUser);
+      } else {
+        localStorage.removeItem('reposcripter_gh_user');
+      }
+    }
+  }, [state.ghUser]);
 
   useEffect(() => {
     // Bootstrap initial prompt if library is empty
@@ -1984,25 +2459,36 @@ function AppContent() {
       return;
     }
     
-    // Default to 'merrypranxter' if ghUser is also empty, though usually ghUser is set during login
     const owner = state.ghUser || 'merrypranxter';
-    const repo = 'repo_script_js5_code';
+    const repo = 'shader_files_2';
     
     setState(s => ({ ...s, isLoadingArchive: true, status: `Rummaging through ${owner}/${repo}...` }));
     try {
-      // Use recursive tree API to find files anywhere in the repo
       const res = await fetch(`${GH_API}/repos/${owner}/${repo}/git/trees/HEAD?recursive=1`, {
         headers: { 'X-GitHub-Token': state.ghToken }
       });
       
       if (!res.ok) {
         if (res.status === 404) {
-          throw new Error(`Repository ${owner}/${repo} not found. Check credentials or owner name.`);
+          throw new Error(`Repository ${owner}/${repo} not found.`);
         }
         throw new Error(`GitHub error ${res.status}`);
       }
       
       const data = await res.json();
+      
+      // Look for metadata.json
+      const metadataFile = (data.tree || []).find((f: any) => f.path === 'metadata.json');
+      let metadata: any = { files: {}, folders: [] };
+      if (metadataFile) {
+        const metaContent = await getFileContent(owner, repo, 'metadata.json', state.ghToken);
+        if (metaContent) {
+          try {
+            metadata = JSON.parse(metaContent);
+          } catch (_) {}
+        }
+      }
+
       const files = (data.tree || [])
         .filter((f: any) => f.type === 'blob' && (
           f.path.endsWith('.js') || 
@@ -2010,29 +2496,185 @@ function AppContent() {
           f.path.endsWith('.txt') ||
           f.path.endsWith('.glsl')
         ))
-        .map((f: any) => ({ 
-          name: f.path.split('/').pop(), 
-          path: f.path, 
-          sha: f.sha 
-        }));
+        .map((f: any) => {
+          const path = f.path;
+          const meta = metadata.files?.[path] || {};
+          return { 
+            name: path.split('/').pop(), 
+            path: path, 
+            sha: f.sha,
+            folder: meta.folder || '',
+            color: meta.color || '',
+            order: meta.order ?? 999,
+            alias: meta.alias || ''
+          };
+        })
+        .sort((a: any, b: any) => a.order - b.order);
         
       setState(s => ({ 
         ...s, 
-        archiveFiles: files, 
+        archiveFiles: files,
+        archiveFolders: metadata.folders || [],
+        archiveMetadata: metadata,
         isLoadingArchive: false, 
-        status: `Loaded ${files.length} recursive archive records` 
+        status: `Loaded ${files.length} archive records` 
       }));
     } catch (e: any) {
-      setState(s => ({ ...s, isLoadingArchive: false, status: `Archive retrieval failed: ${e.message}` }));
+      setState(s => ({ ...s, isLoadingArchive: false, status: `Archive search failed: ${e.message}` }));
     }
+  };
+
+  const handleSaveArchiveMetadata = async (newMetadata: any) => {
+    if (!state.ghToken) return;
+    const owner = state.ghUser || 'merrypranxter';
+    const repo = 'shader_files_2';
+    const path = 'metadata.json';
+
+    try {
+      // Get SHA of current metadata.json if it exists
+      const infoRes = await fetch(`${GH_API}/repos/${owner}/${repo}/contents/${path}`, {
+        headers: { 'X-GitHub-Token': state.ghToken }
+      });
+      let sha = undefined;
+      if (infoRes.ok) {
+        const info = await infoRes.json();
+        sha = info.sha;
+      }
+
+      const res = await fetch(`${GH_API}/repos/${owner}/${repo}/contents/${path}`, {
+        method: 'PUT',
+        headers: {
+          'X-GitHub-Token': state.ghToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: 'Update archive metadata',
+          content: btoa(unescape(encodeURIComponent(JSON.stringify(newMetadata, null, 2)))),
+          sha
+        })
+      });
+
+      if (!res.ok) throw new Error('Failed to update metadata on GitHub');
+      return true;
+    } catch (e) {
+      console.error("Metadata save error:", e);
+      return false;
+    }
+  };
+
+  const updateArchiveFile = async (filePath: string, updates: Partial<{ alias: string, folder: string, color: string, order: number }>) => {
+    const newMetadata = { ...state.archiveMetadata };
+    if (!newMetadata.files) newMetadata.files = {};
+    newMetadata.files[filePath] = { ...newMetadata.files[filePath], ...updates };
+    
+    // Optimistic update
+    setState(s => ({
+      ...s,
+      archiveMetadata: newMetadata,
+      archiveFiles: s.archiveFiles.map(f => f.path === filePath ? { ...f, ...updates } : f)
+    }));
+
+    await handleSaveArchiveMetadata(newMetadata);
+  };
+
+  const handleCreateArchiveFolder = async (folderName: string) => {
+    if (!folderName) return;
+    const newMetadata = { ...state.archiveMetadata };
+    if (!newMetadata.folders) newMetadata.folders = [];
+    if (!newMetadata.folders.includes(folderName)) {
+      newMetadata.folders.push(folderName);
+    }
+    
+    setState(s => ({
+      ...s,
+      archiveMetadata: newMetadata,
+      archiveFolders: newMetadata.folders
+    }));
+
+    await handleSaveArchiveMetadata(newMetadata);
+  };
+
+  const handleRemoveArchiveFolder = async (folderName: string) => {
+    if (!confirm(`Dissolve folder "${folderName}"? Contents will be moved to Root.`)) return;
+    
+    const newMetadata = { ...state.archiveMetadata };
+    if (newMetadata.folders) {
+      newMetadata.folders = newMetadata.folders.filter((f: string) => f !== folderName);
+    }
+    
+    // Move files in this folder to root in metadata
+    const updatedFiles = [...state.archiveFiles].map(f => {
+      if (f.folder === folderName) {
+        if (!newMetadata.files) newMetadata.files = {};
+        if (!newMetadata.files[f.path]) newMetadata.files[f.path] = {};
+        newMetadata.files[f.path].folder = '';
+        return { ...f, folder: '' };
+      }
+      return f;
+    });
+
+    setState(s => ({
+      ...s,
+      archiveMetadata: newMetadata,
+      archiveFolders: newMetadata.folders || [],
+      archiveFiles: updatedFiles
+    }));
+
+    await handleSaveArchiveMetadata(newMetadata);
+  };
+
+  const handleMoveFileToFolder = async (filePath: string, folderName: string) => {
+    await updateArchiveFile(filePath, { folder: folderName });
+  };
+
+  const handleRenameArchiveFile = async (filePath: string, newName: string) => {
+    // We use an alias for naming to avoid heavy GitHub move operations
+    await updateArchiveFile(filePath, { alias: newName });
+  };
+
+  const handleSetFileColor = async (filePath: string, color: string) => {
+    await updateArchiveFile(filePath, { color });
+  };
+
+  const handleReorderArchiveFile = async (filePath: string, direction: 'up' | 'down') => {
+    const sortedFiles = [...state.archiveFiles].sort((a, b) => a.order - b.order);
+    const idx = sortedFiles.findIndex(f => f.path === filePath);
+    if (idx === -1) return;
+
+    if (direction === 'up' && idx > 0) {
+      const prev = sortedFiles[idx - 1];
+      const curr = sortedFiles[idx];
+      const tempOrder = prev.order;
+      prev.order = curr.order;
+      curr.order = tempOrder;
+    } else if (direction === 'down' && idx < sortedFiles.length - 1) {
+      const next = sortedFiles[idx + 1];
+      const curr = sortedFiles[idx];
+      const tempOrder = next.order;
+      next.order = curr.order;
+      curr.order = tempOrder;
+    } else {
+      return;
+    }
+
+    const newMetadata = { ...state.archiveMetadata };
+    if (!newMetadata.files) newMetadata.files = {};
+    sortedFiles.forEach((f, i) => {
+      if (!newMetadata.files[f.path]) newMetadata.files[f.path] = {};
+      newMetadata.files[f.path].order = i;
+      f.order = i;
+    });
+
+    setState(s => ({ ...s, archiveMetadata: newMetadata, archiveFiles: sortedFiles }));
+    await handleSaveArchiveMetadata(newMetadata);
   };
 
   const handleLoadArchiveFile = async (path: string) => {
     if (!state.ghToken) return;
     const owner = state.ghUser || 'merrypranxter';
-    setState(s => ({ ...s, status: `Extracting ${path}...` }));
+    setState(s => ({ ...s, status: `Extracting ${path}...`, lastArchiveLoadedPath: path }));
     try {
-      const content = await getFileContent(owner, 'repo_script_js5_code', path, state.ghToken);
+      const content = await getFileContent(owner, 'shader_files_2', path, state.ghToken);
       if (content) {
         setState(s => ({ ...s, js5Code: content, activePanel: null, status: `✓ Reconstituted ${path}` }));
       }
@@ -2059,14 +2701,16 @@ function AppContent() {
     if (!state.artPrompt) return;
 
     try {
-      const title = state.artPrompt.split(' ').slice(0, 3).join(' ') + '...';
+      const title = state.recipeTitle?.trim() || (state.artPrompt.split(' ').slice(0, 3).join(' ') + '...');
       await addDoc(collection(db, 'prompts'), {
         userId: user.uid,
         title: title,
         text: state.artPrompt,
+        selectedRepos: state.selectedRepos.map(r => ({ name: r.name, owner: r.owner })),
+        entropy: state.entropy,
         createdAt: serverTimestamp()
       });
-      setState(s => ({ ...s, status: '✓ Prompt Saved to Library' }));
+      setState(s => ({ ...s, recipeTitle: '', status: '✓ Recipe Saved to Book' }));
     } catch (e) {
       handleFirestoreError(e);
     }
@@ -2135,27 +2779,63 @@ function AppContent() {
 
   const handleGitHubExport = async () => {
     if (!state.ghToken || !state.js5Code) {
-      setState(s => ({ ...s, status: 'Error: Need GitHub token and generated code' }));
+      setState(s => ({ ...s, exportSuccessMessage: '❌ Error: Need GitHub token and generated code', status: 'Error: Need GitHub token and generated code' }));
       return;
     }
 
-    setState(s => ({ ...s, isExportingToGH: true, status: 'Exporting to GitHub...' }));
+    setState(s => ({ ...s, isExportingToGH: true, exportSuccessMessage: '', status: 'Exporting to GitHub...' }));
 
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: `Generate a short, relevant, simple filename (including .js or .txt extension) for this JS5 art code based on this prompt: "${state.artPrompt}". Return ONLY the filename.`,
-      });
+      const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
+      const ai = new GoogleGenAI({ apiKey });
+      
+      let rawFilename = state.exportFilename?.trim();
 
-      const filename = response.text?.trim().replace(/['"]/g, '') || `art_${Date.now()}.js`;
-      const owner = state.ghUser;
-      const repo = 'repo_script_js5_code';
+      if (!rawFilename) {
+        try {
+          const response = await ai.models.generateContent({
+            model: "gemini-3.5-flash",
+            contents: `Generate a short, relevant, simple filename (including .js or .txt extension) for this JS5 art code based on this prompt: "${state.artPrompt}". Return ONLY the filename.`,
+          });
+          rawFilename = response.text?.trim().replace(/['"`]/g, '') || `art.js`;
+        } catch (geminiErr: any) {
+          console.warn("AI Filename generation failed, using fallback:", geminiErr);
+          rawFilename = `art.js`;
+        }
+      }
+
+      // Ensure appropriate extensions
+      if (!/\.(js|js5|txt|glsl)$/i.test(rawFilename)) {
+        rawFilename += '.js';
+      }
+
+      let filename = rawFilename;
+      if (state.exportAutoSuffix) {
+        const extIndex = rawFilename.lastIndexOf('.');
+        const namePart = rawFilename.substring(0, extIndex);
+        const extPart = rawFilename.substring(extIndex);
+        
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        const day = String(now.getDate()).padStart(2, '0');
+        const h = String(now.getHours()).padStart(2, '0');
+        const m = String(now.getMinutes()).padStart(2, '0');
+        const sSec = String(now.getSeconds()).padStart(2, '0');
+        
+        filename = `${namePart}_${year}${month}${day}_${h}${m}${sSec}${extPart}`;
+      }
+
+      // Sanitize the filename to handle spaces/symbols properly
+      filename = filename.replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+
+      const owner = state.ghUser || 'merrypranxter';
+      const repo = 'shader_files_2';
       const path = filename;
 
       // Check if file exists to get SHA (for updates, though we usually create new)
       const contentRes = await fetch(`${GH_API}/repos/${owner}/${repo}/contents/${path}`, {
-        headers: { Authorization: `Bearer ${state.ghToken}` }
+        headers: { 'X-GitHub-Token': state.ghToken }
       });
 
       let sha = undefined;
@@ -2167,7 +2847,7 @@ function AppContent() {
       const putRes = await fetch(`${GH_API}/repos/${owner}/${repo}/contents/${path}`, {
         method: 'PUT',
         headers: {
-          Authorization: `Bearer ${state.ghToken}`,
+          'X-GitHub-Token': state.ghToken,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -2182,9 +2862,24 @@ function AppContent() {
         throw new Error(error.message || 'Failed to push to GitHub');
       }
 
-      setState(s => ({ ...s, isExportingToGH: false, status: `Successfully exported to ${owner}/${repo}/${path}` }));
+      setState(s => ({ 
+        ...s, 
+        isExportingToGH: false, 
+        exportSuccessMessage: `✓ Successfully saved to ${owner}/${repo}/${path}`, 
+        status: `Successfully exported to ${owner}/${repo}/${path}` 
+      }));
+      
+      // Auto-reload the backup/archive panel if loaded
+      try {
+        handleLoadArchive();
+      } catch (_) {}
     } catch (e: any) {
-      setState(s => ({ ...s, isExportingToGH: false, status: `Export failed: ${e.message}` }));
+      setState(s => ({ 
+        ...s, 
+        isExportingToGH: false, 
+        exportSuccessMessage: `❌ Export failed: ${e.message}`, 
+        status: `Export failed: ${e.message}` 
+      }));
     }
   };
 
@@ -2401,7 +3096,7 @@ function AppContent() {
               canvas.__three = { renderer, scene, camera, material };
             } catch (e) {
               console.error("WebGL Initialization Failed:", e);
-              return; // Exit early if WebGL fails
+              throw e; // Throw so the runtime displays the error
             }
           }
           const { renderer, scene, camera, material } = canvas.__three;
@@ -2423,13 +3118,15 @@ function AppContent() {
         - SAFE PROPERTY ACCESS: When using Three.js ShaderMaterials, ensure uniforms are fully defined before accessing or updating their '.value' properties. NEVER access 'material.uniforms' without checking if 'material' exists first. Use optional chaining (material?.uniforms?.u_time?.value = time) or explicit if-guards.
         - GLSL VERSIONING: 
           1. NEVER manually add '#version 300 es' to your shaders. Three.js prepends its own defines, which will cause a compilation error if your version directive is not on the absolute first line.
-          2. To use GLSL 3.0 features (like 'in', 'out', 'texture()'), set 'glslVersion: THREE.GLSL3' in your 'ShaderMaterial' options.
-          3. PREFER 'ShaderMaterial' over 'RawShaderMaterial'. 'RawShaderMaterial' does not handle versioning or built-in attributes/uniforms, which often leads to compilation failures in this environment.
-          4. BUILT-IN ATTRIBUTES: In 'ShaderMaterial', Three.js automatically declares 'position', 'uv', 'normal', and standard matrices (modelViewMatrix, projectionMatrix, etc.). DO NOT redeclare them in your shader code as it will cause a "redefinition" error.
-          5. Example: 
+          2. To use GLSL 3.0 features (like 'in', 'out', 'texture()'), YOU MUST set 'glslVersion: THREE.GLSL3' in your 'ShaderMaterial' options.
+          3. MANDATORY OUTPUT: If 'glslVersion: THREE.GLSL3' is used, you MUST declare 'out vec4 fragColor;' at the top level of your fragment shader and assign to it in 'main()'. 
+          4. NAMESPACE HYGIENE: Do not use 'gl_FragColor' when 'glslVersion: THREE.GLSL3' is active. Use 'fragColor' instead.
+          5. PREFER 'ShaderMaterial' over 'RawShaderMaterial'. 'RawShaderMaterial' does not handle versioning or built-in attributes/uniforms, which often leads to compilation failures in this environment.
+          6. BUILT-IN ATTRIBUTES: In 'ShaderMaterial', Three.js automatically declares 'position', 'uv', 'normal', and standard matrices (modelViewMatrix, projectionMatrix, etc.). DO NOT redeclare them in your shader code as it will cause a "redefinition" error.
+          7. Correct Example: 
              const material = new THREE.ShaderMaterial({
                glslVersion: THREE.GLSL3,
-               uniforms: { ... },
+               uniforms: { u_time: { value: 0 } },
                vertexShader: \`
                  out vec2 vUv;
                  void main() {
@@ -2481,6 +3178,17 @@ function AppContent() {
         ${ctx.fileContents.map(f => `--- FILE: ${f.path} ---\n${f.content}`).join('\n\n')}
       `).join('\n---\n');
 
+      const lowPowerDirective = state.isLowPowerMode ? `
+        
+        [OPTIMIZATION DIRECTIVE (LOW-POWER HARDWARE ACTIVE)]
+        CRITICAL: The user has enabled "Low-Power / Safe Mode" because their device's GPU is older or prone to black screens/timeouts.
+        1. Keep formulas, shaders, and draw operations extremely lightweight.
+        2. Strictly avoid deep nested loops, intensive ray-marching, complex spatial feedback loops, or heavy per-pixel math (especially in WebGL/Fragment Shaders).
+        3. Reduce any shader noise/fractal octaves to a minimum (e.g., 1 or 2 octaves max instead of 4-6).
+        4. When possible, favor standard HTML5 2D canvas context ('ctx') drawing (e.g. lines, arcs, grids, lightweight particles) instead of Three.js. Standard 2D Canvas is highly optimized and works beautifully on old machines.
+        5. If using Three.js, create simple mesh geometry and lightweight shaders that compile and run instantly.
+      ` : '';
+
       const userMsg = `
         REPOS:
         ${reposInfo}
@@ -2490,6 +3198,7 @@ function AppContent() {
         
         [NON-ASCII DIRECTIVE]
         Avoid returning character grids. Use the 'ctx' to draw fluid, strange, and complex generative systems. Think in terms of pixels, paths, noise, and procedural geometry.
+        ${lowPowerDirective}
         
         Generate the JS5 code now.
       `.trim();
@@ -2630,7 +3339,7 @@ function AppContent() {
                 icon={Library} 
                 active={state.activePanel === 'library'} 
                 onClick={() => togglePanel('library')} 
-                label="Prompt Library"
+                label="Recipe Book"
               />
               <SidebarIcon 
                 icon={Download} 
@@ -2787,8 +3496,12 @@ function AppContent() {
             className="absolute left-20 top-6 bottom-6 w-96 bg-panel/90 backdrop-blur-xl border border-border shadow-2xl z-40 flex flex-col rounded-lg overflow-hidden"
           >
             <div className="p-4 border-b border-border flex items-center justify-between bg-panel2/50">
-              <h2 className="text-[0.7rem] font-bold tracking-[0.2em] uppercase text-accent2">
-                {state.activePanel}
+              <h2 className="text-[0.7rem] font-bold tracking-[0.2em] uppercase text-accent2 flex items-center gap-1.5 animate-fade-in">
+                {state.activePanel === 'library' ? (
+                  <>
+                    <Library className="w-3.5 h-3.5 text-accent animate-pulse" /> Recipe Book
+                  </>
+                ) : state.activePanel}
               </h2>
               <button onClick={() => setState(s => ({ ...s, activePanel: null }))} className="text-muted hover:text-accent3">
                 <X className="w-4 h-4" />
@@ -2815,7 +3528,13 @@ function AppContent() {
                   state={state} 
                   setState={setState} 
                   handleLoadArchive={handleLoadArchive} 
-                  handleLoadArchiveFile={handleLoadArchiveFile} 
+                  handleLoadArchiveFile={handleLoadArchiveFile}
+                  handleRenameArchiveFile={handleRenameArchiveFile}
+                  handleMoveFileToFolder={handleMoveFileToFolder}
+                  handleSetFileColor={handleSetFileColor}
+                  handleReorderArchiveFile={handleReorderArchiveFile}
+                  handleCreateArchiveFolder={handleCreateArchiveFolder}
+                  handleRemoveArchiveFolder={handleRemoveArchiveFolder}
                 />
               )}
               {state.activePanel === 'settings' && <SettingsPanel state={state} setState={setState} user={user} handleLogout={handleLogout} handleLogin={handleLogin} />}

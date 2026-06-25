@@ -79,7 +79,35 @@ export async function addDoc(colPath: string, data: any) {
       seconds: Date.now() / 1000
     }
   };
-  localStorage.setItem(key, JSON.stringify([newItem, ...current]));
+  
+  let listToSave = [newItem, ...current];
+  
+  // Cap sizes to prevent local storage quota issues
+  if (key === 'reposcripter_renders') {
+    // Keep a maximum of 8 history items for renders to strictly avoid QuotaExceededError
+    listToSave = listToSave.slice(0, 8);
+  } else if (key === 'reposcripter_prompts') {
+    // Keep a maximum of 50 recipes
+    listToSave = listToSave.slice(0, 50);
+  }
+
+  try {
+    localStorage.setItem(key, JSON.stringify(listToSave));
+  } catch (error) {
+    console.warn("Storage write failed, attempting aggressive truncation for key:", key, error);
+    // If it still failed, truncate even more aggressively
+    if (key === 'reposcripter_renders') {
+      listToSave = listToSave.slice(0, 3);
+    } else {
+      listToSave = listToSave.slice(0, 10);
+    }
+    try {
+      localStorage.setItem(key, JSON.stringify(listToSave));
+    } catch (e) {
+      console.error("Critical storage write failure:", e);
+    }
+  }
+
   window.dispatchEvent(new Event('storage'));
   return { id: newItem.id };
 }
@@ -89,7 +117,11 @@ export async function deleteDoc(docRef: any) {
   const key = STORAGE_KEYS[colPath as keyof typeof STORAGE_KEYS] || STORAGE_KEYS.renders;
   const current = JSON.parse(localStorage.getItem(key) || '[]');
   const filtered = current.filter((item: any) => item.id !== id);
-  localStorage.setItem(key, JSON.stringify(filtered));
+  try {
+    localStorage.setItem(key, JSON.stringify(filtered));
+  } catch (error) {
+    console.error("Local Storage Error during deletion:", error);
+  }
   window.dispatchEvent(new Event('storage'));
 }
 
